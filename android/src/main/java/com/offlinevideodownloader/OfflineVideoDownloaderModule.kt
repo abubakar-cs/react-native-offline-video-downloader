@@ -211,198 +211,201 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
 
                 downloadHelper.prepare(object : DownloadHelper.Callback {
                     override fun onPrepared(helper: DownloadHelper, tracksInfoAvailable: Boolean) {
-                        try {
-                            val streamType = detectStreamType(helper)
-                            val allowedQualities = setOf(480, 720, 1080)
+                        CoroutineScope(Dispatchers.Main).launch {
+                            try {
+                                val streamType = detectStreamType(helper)
+                                val allowedQualities = setOf(480, 720, 1080)
 
-                            val videoTrackMap = mutableMapOf<Int, WritableMap>()
-                            val videoBitrateMap = mutableMapOf<Int, Int>()
-                            val videoTrackIdentifiers = mutableMapOf<Int, TrackIdentifier>()
+                                val videoTrackMap = mutableMapOf<Int, WritableMap>()
+                                val videoBitrateMap = mutableMapOf<Int, Int>()
+                                val videoTrackIdentifiers = mutableMapOf<Int, TrackIdentifier>()
 
-                            val audioTrackMap = mutableMapOf<String, WritableMap>()
+                                val audioTrackMap = mutableMapOf<String, WritableMap>()
 
-                            var totalDurationSec = 0.0
+                                var totalDurationSec = 0.0
 
-                            for (periodIndex in 0 until helper.periodCount) {
-                                val mappedTrackInfo = helper.getMappedTrackInfo(periodIndex)
+                                for (periodIndex in 0 until helper.periodCount) {
+                                    val mappedTrackInfo = helper.getMappedTrackInfo(periodIndex)
 
-                                if (periodIndex == 0) {
-                                    val manifest = helper.manifest as? HlsManifest
-                                    totalDurationSec = manifest?.mediaPlaylist?.segments?.sumOf {
-                                        it.durationUs / 1_000_000.0
-                                    } ?: 0.0
-                                }
+                                    if (periodIndex == 0) {
+                                        val manifest = helper.manifest as? HlsManifest
+                                        totalDurationSec = manifest?.mediaPlaylist?.segments?.sumOf {
+                                            it.durationUs / 1_000_000.0
+                                        } ?: 0.0
+                                    }
 
-                                for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
-                                    val trackGroups = mappedTrackInfo.getTrackGroups(rendererIndex)
+                                    for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
+                                        val trackGroups = mappedTrackInfo.getTrackGroups(rendererIndex)
 
-                                    if (trackGroups.length > 0) {
-                                        val rendererType = mappedTrackInfo.getRendererType(rendererIndex)
+                                        if (trackGroups.length > 0) {
+                                            val rendererType = mappedTrackInfo.getRendererType(rendererIndex)
 
-                                        // VIDEO TRACKS - Filter out Dolby Vision
-                                        if (rendererType == C.TRACK_TYPE_VIDEO) {
-                                            for (groupIndex in 0 until trackGroups.length) {
-                                                val group = trackGroups.get(groupIndex)
+                                            // VIDEO TRACKS - Filter out Dolby Vision
+                                            if (rendererType == C.TRACK_TYPE_VIDEO) {
+                                                for (groupIndex in 0 until trackGroups.length) {
+                                                    val group = trackGroups.get(groupIndex)
 
-                                                for (trackIndex in 0 until group.length) {
-                                                    val format = group.getFormat(trackIndex)
+                                                    for (trackIndex in 0 until group.length) {
+                                                        val format = group.getFormat(trackIndex)
 
-                                                    // ⚠️ FILTER OUT DOLBY VISION
-                                                    if (isDolbyVisionFormat(format)) {
-                                                        Log.d(MODULE_NAME, "Skipping Dolby Vision track: ${format.height}p, codec: ${format.codecs}")
-                                                        continue
-                                                    }
+                                                        // ⚠️ FILTER OUT DOLBY VISION
+                                                        if (isDolbyVisionFormat(format)) {
+                                                            Log.d(MODULE_NAME, "Skipping Dolby Vision track: ${format.height}p, codec: ${format.codecs}")
+                                                            continue
+                                                        }
 
-                                                    if (format.height in allowedQualities && format.bitrate > 0) {
-                                                        // Filter I-FRAME streams
-                                                        val isIFrameStream = (format.roleFlags and C.ROLE_FLAG_TRICK_PLAY) != 0 ||
-                                                                format.containerMimeType?.contains("image") == true
-                                                        val expectedMinBitrate = getMinExpectedBitrate(format.height)
-                                                        val isProbablyIFrame = format.bitrate < expectedMinBitrate
+                                                        if (format.height in allowedQualities && format.bitrate > 0) {
+                                                            // Filter I-FRAME streams
+                                                            val isIFrameStream = (format.roleFlags and C.ROLE_FLAG_TRICK_PLAY) != 0 ||
+                                                                    format.containerMimeType?.contains("image") == true
+                                                            val expectedMinBitrate = getMinExpectedBitrate(format.height)
+                                                            val isProbablyIFrame = format.bitrate < expectedMinBitrate
 
-                                                        if (!isIFrameStream && !isProbablyIFrame) {
-                                                            // Keep track with highest bitrate per quality
-                                                            val existingBitrate = videoBitrateMap[format.height] ?: 0
+                                                            if (!isIFrameStream && !isProbablyIFrame) {
+                                                                // Keep track with highest bitrate per quality
+                                                                val existingBitrate = videoBitrateMap[format.height] ?: 0
 
-                                                            if (format.bitrate > existingBitrate) {
-                                                                videoBitrateMap[format.height] = format.bitrate
+                                                                if (format.bitrate > existingBitrate) {
+                                                                    videoBitrateMap[format.height] = format.bitrate
 
-                                                                val estimatedSizeBytes = if (totalDurationSec > 0) {
-                                                                    runBlocking {
-                                                                        calculateAccurateStreamSize(
-                                                                            helper,
-                                                                            format,
-                                                                            totalDurationSec,
-                                                                            streamType,
-                                                                            headers
-                                                                        )
+                                                                    val estimatedSizeBytes = if (totalDurationSec > 0) {
+                                                                        withContext(Dispatchers.IO) {
+                                                                            calculateAccurateStreamSize(
+                                                                                helper,
+                                                                                format,
+                                                                                totalDurationSec,
+                                                                                streamType,
+                                                                                headers
+                                                                            )
+                                                                        }
+                                                                    } else 0L
+
+                                                                    videoTrackIdentifiers[format.height] = TrackIdentifier(
+                                                                        periodIndex = periodIndex,
+                                                                        groupIndex = groupIndex,
+                                                                        trackIndex = trackIndex,
+                                                                        format = format,
+                                                                        trackGroup = group,
+                                                                        actualSizeBytes = estimatedSizeBytes
+                                                                    )
+
+                                                                    val trackData = Arguments.createMap().apply {
+                                                                        putInt("height", format.height)
+                                                                        putInt("width", format.width)
+                                                                        putInt("bitrate", format.bitrate)
+                                                                        putDouble("size", estimatedSizeBytes.toDouble())
+                                                                        putString("formattedSize", formatBytes(estimatedSizeBytes))
+                                                                        putString("trackId", "$periodIndex:$groupIndex:$trackIndex")
+                                                                        putString("quality", "${format.height}p")
+                                                                        putString("streamType", streamType.name)
+                                                                        putString("codecs", format.codecs)
                                                                     }
-                                                                } else 0L
 
-                                                                videoTrackIdentifiers[format.height] = TrackIdentifier(
-                                                                    periodIndex = periodIndex,
-                                                                    groupIndex = groupIndex,
-                                                                    trackIndex = trackIndex,
-                                                                    format = format,
-                                                                    trackGroup = group,
-                                                                    actualSizeBytes = estimatedSizeBytes
-                                                                )
+                                                                    videoTrackMap[format.height] = trackData
 
-                                                                val trackData = Arguments.createMap().apply {
-                                                                    putInt("height", format.height)
-                                                                    putInt("width", format.width)
-                                                                    putInt("bitrate", format.bitrate)
-                                                                    putDouble("size", estimatedSizeBytes.toDouble())
-                                                                    putString("formattedSize", formatBytes(estimatedSizeBytes))
-                                                                    putString("trackId", "$periodIndex:$groupIndex:$trackIndex")
-                                                                    putString("quality", "${format.height}p")
-                                                                    putString("streamType", streamType.name)
-                                                                    putString("codecs", format.codecs)
+                                                                    Log.d(MODULE_NAME, "Selected SDR track: ${format.height}p, ${format.bitrate} bps, codec: ${format.codecs}")
                                                                 }
-
-                                                                videoTrackMap[format.height] = trackData
-
-                                                                Log.d(MODULE_NAME, "Selected SDR track: ${format.height}p, ${format.bitrate} bps, codec: ${format.codecs}")
                                                             }
                                                         }
                                                     }
                                                 }
                                             }
-                                        }
 
-                                        // AUDIO TRACKS - Filter out Dolby Atmos/Digital, keep only stereo
-                                        if (rendererType == C.TRACK_TYPE_AUDIO &&
-                                            streamType == StreamType.SEPARATE_AUDIO_VIDEO &&
-                                            periodIndex == 0) {
+                                            // AUDIO TRACKS - Filter out Dolby Atmos/Digital, keep only stereo
+                                            if (rendererType == C.TRACK_TYPE_AUDIO &&
+                                                streamType == StreamType.SEPARATE_AUDIO_VIDEO &&
+                                                periodIndex == 0) {
 
-                                            for (groupIndex in 0 until trackGroups.length) {
-                                                val group = trackGroups.get(groupIndex)
+                                                for (groupIndex in 0 until trackGroups.length) {
+                                                    val group = trackGroups.get(groupIndex)
 
-                                                for (trackIndex in 0 until group.length) {
-                                                    val format = group.getFormat(trackIndex)
+                                                    for (trackIndex in 0 until group.length) {
+                                                        val format = group.getFormat(trackIndex)
 
-                                                    // ⚠️ FILTER OUT DOLBY AUDIO
-                                                    val isDolbyAtmos = format.sampleMimeType?.contains("eac3-joc") == true
-                                                    val isDolbyDigital = format.sampleMimeType?.contains("eac3") == true ||
-                                                            format.sampleMimeType?.contains("ac-3") == true
+                                                        // ⚠️ FILTER OUT DOLBY AUDIO
+                                                        val isDolbyAtmos = format.sampleMimeType?.contains("eac3-joc") == true
+                                                        val isDolbyDigital = format.sampleMimeType?.contains("eac3") == true ||
+                                                                format.sampleMimeType?.contains("ac-3") == true
 
-                                                    if (isDolbyAtmos || isDolbyDigital) {
-                                                        Log.d(MODULE_NAME, "Skipping Dolby audio track: ${format.sampleMimeType}, channels: ${format.channelCount}")
-                                                        continue
-                                                    }
-
-                                                    // Only accept stereo (2 channels) or lower
-                                                    if (format.channelCount > 2) {
-                                                        Log.d(MODULE_NAME, "Skipping surround audio track: ${format.channelCount} channels")
-                                                        continue
-                                                    }
-
-                                                    val language = format.language ?: "unknown"
-                                                    val audioBitrate = if (format.bitrate > 0) format.bitrate else 128000
-
-                                                    val estimatedSizeBytes = if (totalDurationSec > 0) {
-                                                        calculateAudioOnlySize(audioBitrate, totalDurationSec)
-                                                    } else 0L
-
-                                                    // Only keep best stereo track per language
-                                                    val existingTrack = audioTrackMap[language]
-                                                    val existingBitrate = existingTrack?.getInt("bitrate") ?: 0
-
-                                                    if (format.bitrate > existingBitrate) {
-                                                        val audioTrackData = Arguments.createMap().apply {
-                                                            putString("language", language)
-                                                            putString("label", format.label ?: "Stereo $language")
-                                                            putInt("channelCount", format.channelCount)
-                                                            putString("audioType", "stereo")
-                                                            putInt("bitrate", audioBitrate)
-                                                            putDouble("size", estimatedSizeBytes.toDouble())
-                                                            putString("formattedSize", formatBytes(estimatedSizeBytes))
-                                                            putString("mimeType", format.sampleMimeType)
+                                                        if (isDolbyAtmos || isDolbyDigital) {
+                                                            Log.d(MODULE_NAME, "Skipping Dolby audio track: ${format.sampleMimeType}, channels: ${format.channelCount}")
+                                                            continue
                                                         }
 
-                                                        audioTrackMap[language] = audioTrackData
+                                                        // Only accept stereo (2 channels) or lower
+                                                        if (format.channelCount > 2) {
+                                                            Log.d(MODULE_NAME, "Skipping surround audio track: ${format.channelCount} channels")
+                                                            continue
+                                                        }
 
-                                                        Log.d(MODULE_NAME, "Selected stereo audio: $language, ${format.channelCount}ch, ${audioBitrate} bps")
+                                                        val language = format.language ?: "unknown"
+                                                        val audioBitrate = if (format.bitrate > 0) format.bitrate else 128000
+
+                                                        val estimatedSizeBytes = if (totalDurationSec > 0) {
+                                                            calculateAudioOnlySize(audioBitrate, totalDurationSec)
+                                                        } else 0L
+
+                                                        // Only keep best stereo track per language
+                                                        val existingTrack = audioTrackMap[language]
+                                                        val existingBitrate = existingTrack?.getInt("bitrate") ?: 0
+
+                                                        if (format.bitrate > existingBitrate) {
+                                                            val audioTrackData = Arguments.createMap().apply {
+                                                                putString("language", language)
+                                                                putString("label", format.label ?: "Stereo $language")
+                                                                putInt("channelCount", format.channelCount)
+                                                                putString("audioType", "stereo")
+                                                                putInt("bitrate", audioBitrate)
+                                                                putDouble("size", estimatedSizeBytes.toDouble())
+                                                                putString("formattedSize", formatBytes(estimatedSizeBytes))
+                                                                putString("mimeType", format.sampleMimeType)
+                                                            }
+
+                                                            audioTrackMap[language] = audioTrackData
+
+                                                            Log.d(MODULE_NAME, "Selected stereo audio: $language, ${format.channelCount}ch, ${audioBitrate} bps")
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                            }
 
-                            storedTrackIdentifiers[masterUrl] = videoTrackIdentifiers
+                                storedTrackIdentifiers[masterUrl] = videoTrackIdentifiers
 
-                            // Build response
-                            val videoTracks = Arguments.createArray()
-                            val sortedVideoQualities = listOf(1080, 720, 480)
-                            sortedVideoQualities.forEach { height ->
-                                videoTrackMap[height]?.let { trackData ->
-                                    videoTracks.pushMap(trackData)
+                                // Build response
+                                val videoTracks = Arguments.createArray()
+                                val sortedVideoQualities = listOf(1080, 720, 480)
+                                sortedVideoQualities.forEach { height ->
+                                    videoTrackMap[height]?.let { trackData ->
+                                        videoTracks.pushMap(trackData)
+                                    }
                                 }
-                            }
 
-                            val audioTracks = Arguments.createArray()
-                            audioTrackMap.values.forEach {
-                                audioTracks.pushMap(it)
-                            }
+                                val audioTracks = Arguments.createArray()
+                                audioTrackMap.values.forEach {
+                                    audioTracks.pushMap(it)
+                                }
 
-                            promise.resolve(Arguments.createMap().apply {
-                                putArray("videoTracks", videoTracks)
-                                putArray("audioTracks", audioTracks)
-                                putDouble("duration", totalDurationSec)
-                                putString("streamType", streamType.name)
-                                putArray("allowedQualities", Arguments.createArray().apply {
-                                    allowedQualities.forEach { pushInt(it) }
+                                promise.resolve(Arguments.createMap().apply {
+                                    putArray("videoTracks", videoTracks)
+                                    putArray("audioTracks", audioTracks)
+                                    putDouble("duration", totalDurationSec)
+                                    putString("streamType", streamType.name)
+                                    putArray("allowedQualities", Arguments.createArray().apply {
+                                        allowedQualities.forEach { pushInt(it) }
+                                    })
+                                    putInt("availableQualityCount", videoTrackMap.size)
                                 })
-                                putInt("availableQualityCount", videoTrackMap.size)
-                            })
 
-                        } catch (e: Exception) {
-                            promise.reject("PROCESSING_ERROR", "Failed to process tracks: ${e.message}")
-                        } finally {
-                            helper.release()
+                            } catch (e: Exception) {
+                                promise.reject("PROCESSING_ERROR", "Failed to process tracks: ${e.message}")
+                            } finally {
+                                helper.release()
+                            }
                         }
+
                     }
 
                     override fun onPrepareError(helper: DownloadHelper, e: java.io.IOException) {
