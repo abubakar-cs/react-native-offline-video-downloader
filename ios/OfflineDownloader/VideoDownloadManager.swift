@@ -601,10 +601,9 @@ class VideoDownloadManager: NSObject {
         }
     }
     
-    @objc private func handleBackgroundSessionReady(_ notification: Notification) {
-        if let wrapper = notification.object as? NSObject,
-           let handler = wrapper.value(forKey: "handler") as? () -> Void {
-            self.backgroundCompletionHandler = handler
+     @objc private func handleBackgroundSessionReady(_ notification: Notification) {
+        if let wrapper = notification.object as? CompletionHandlerWrapper {
+            self.backgroundCompletionHandler = wrapper.handler
         }
     }
     
