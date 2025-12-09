@@ -217,7 +217,7 @@ class VideoDownloadManager: NSObject {
         selectedWidth: Int,
         taskIdentifier: UInt
     ) {
-        let taskData: [String: Any] = [
+        var taskData: [String: Any] = [
             "downloadId": downloadId,
             "masterUrl": masterUrl,
             "selectedHeight": selectedHeight,
@@ -227,6 +227,10 @@ class VideoDownloadManager: NSObject {
             "state": "active"
         ]
         
+        if let track = downloadToTrackMapping[downloadId] {
+            taskData["expectedSizeBytes"] = track.actualSizeBytes
+        }
+
         do {
             let jsonData = try JSONSerialization.data(withJSONObject: taskData)
             mmkv.set(jsonData, forKey: "download_\(downloadId)")
@@ -601,7 +605,7 @@ class VideoDownloadManager: NSObject {
         }
     }
     
-     @objc private func handleBackgroundSessionReady(_ notification: Notification) {
+    @objc private func handleBackgroundSessionReady(_ notification: Notification) {
         if let wrapper = notification.object as? CompletionHandlerWrapper {
             self.backgroundCompletionHandler = wrapper.handler
         }
@@ -621,6 +625,23 @@ class VideoDownloadManager: NSObject {
                 self.backgroundCompletionHandler = nil
             }
         }
+    }
+    
+    private func getExpectedSizeForDownload(downloadId: String) -> Int64? {
+        guard let data = mmkv.data(forKey: "download_\(downloadId)") else {
+            return nil
+        }
+
+        do {
+            if let taskData = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let expected = taskData["expectedSizeBytes"] as? Int64 {
+                    return expected
+                }
+            }
+        } catch {
+            print("Failed to decode expected size for \(downloadId): \(error)")
+        }
+        return nil
     }
     
     private func setupNetworkMonitoring() {
@@ -693,38 +714,57 @@ class VideoDownloadManager: NSObject {
     }
     
     private func registerOrphanedDownload(downloadId: String, location: URL) {
-        let size = getFileSize(at: location)
-        
-        guard size > 0 else {
+        let actualSize = getFileSize(at: location)
+        guard actualSize > 0 else { return }
+
+        // Do not auto-complete if we still track this as incomplete/active
+        if incompleteDownloads.contains(downloadId) || activeDownloads[downloadId] != nil {
             return
         }
-        
+
+        // Resolve expected size (if any) and validate against it
+        let expectedSize = getExpectedSizeForDownload(downloadId: downloadId)
+        if let expectedSize = expectedSize {
+            let tolerance: Double = 0.01
+            let lower = Double(expectedSize) * (1.0 - tolerance)
+            let upper = Double(expectedSize) * (1.0 + tolerance)
+
+            if !(Double(actualSize) >= lower && Double(actualSize) <= upper) {
+                // Size mismatch → treat as partial; do NOT register as completed
+                return
+            }
+        }
+
+        // Decide what totalBytes to report (fallback to actualSize if no expected)
+        let resolvedTotalBytes: Int64 = expectedSize ?? actualSize
+
         offlineRegistry.registerDownload(
             downloadId: downloadId,
             localUrl: location
-        ) { success in
+        ) { [weak self] success in
+            guard let self = self else { return }
             if success {
-                
-                guard self.isJavascriptLoaded else {
-                    return
-                }
-                
+                self.removePersistedTask(downloadId: downloadId)
+                self.removePartialDownload(downloadId: downloadId)
+
+                guard self.isJavascriptLoaded else { return }
+
                 DispatchQueue.main.async {
                     self.eventEmitter?.sendEvent(withName: "DownloadProgress", body: [
                         "downloadId": downloadId,
                         "localUri": location.absoluteString,
                         "state": "completed",
                         "progress": 100,
-                        "bytesDownloaded": size,
+                        "bytesDownloaded": actualSize,
+                        "formattedDownloaded": self.formatBytes(actualSize),
+                        "totalBytes": resolvedTotalBytes,
+                        "formattedTotal": self.formatBytes(resolvedTotalBytes),
                         "isCompleted": true
                     ])
                 }
-                
-                self.removePersistedTask(downloadId: downloadId)
             }
         }
     }
-
 
     private func extractDownloadIdFromFilename(_ filename: String) -> String? {
         let components = filename.replacingOccurrences(of: ".movpkg", with: "").split(separator: "_")
@@ -737,23 +777,41 @@ class VideoDownloadManager: NSObject {
         return nil
     }
 
+
     private func isDownloadComplete(at url: URL) -> Bool {
         let fileManager = FileManager.default
-        
+
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
               isDirectory.boolValue else {
             return false
         }
-        
+
         let asset = AVURLAsset(url: url)
-        
         let durationSeconds = CMTimeGetSeconds(asset.duration)
         let isPlayable = asset.isPlayable
-        
-        let isComplete = durationSeconds > 0 && isPlayable
-        return isComplete
+
+        if let downloadId = extractDownloadIdFromFilename(url.lastPathComponent),
+           let expectedSize = getExpectedSizeForDownload(downloadId: downloadId) {
+
+            let actualSize = getFileSize(at: url)
+            if actualSize <= 0 { return false }
+
+            let tolerance: Double = 0.01
+            let lower = Double(expectedSize) * (1.0 - tolerance)
+            let upper = Double(expectedSize) * (1.0 + tolerance)
+
+            return durationSeconds > 0 &&
+                   isPlayable &&
+                   Double(actualSize) >= lower &&
+                   Double(actualSize) <= upper &&
+                   !incompleteDownloads.contains(downloadId)
+        }
+
+        // Fallback for unknown IDs: require playable + non-trivial duration
+        return durationSeconds > 0 && isPlayable
     }
+
     
     func getAvailableTracks(
         masterUrl: String,
@@ -1003,6 +1061,8 @@ class VideoDownloadManager: NSObject {
             activeDownloads[downloadId] = downloadTask
             downloadProgress[downloadId] = DownloadProgressInfo()
             
+            downloadToTrackMapping[downloadId] = track
+            
             persistDownloadTask(
                 downloadId: downloadId,
                 masterUrl: masterUrl,
@@ -1024,8 +1084,6 @@ class VideoDownloadManager: NSObject {
                     "progress": 0
                 ])
             }
-            
-            downloadToTrackMapping[downloadId] = track
             
             let response: [String: Any] = [
                 "downloadId": downloadId,
@@ -1230,37 +1288,38 @@ class VideoDownloadManager: NSObject {
     ) {
         let registeredDownloads = offlineRegistry.getAllDownloadedStreams()
         var allDownloads: [[String: Any]] = []
-        
-        for download in registeredDownloads {
-            if let downloadId = download["downloadId"] as? String {
-                var downloadInfo = download
-                
-                downloadInfo["downloadId"] = downloadId
-                downloadInfo["state"] = "completed"
-                downloadInfo["progress"] = 100
-                downloadInfo["isCompleted"] = true
-                
-                allDownloads.append(downloadInfo)
-            }
-        }
-        
-        // Add active downloads
+
         for (downloadId, progressInfo) in downloadProgress {
-            if !allDownloads.contains(where: { ($0["downloadId"] as? String) == downloadId }) {
-                allDownloads.append([
-                    "downloadId": downloadId,
-                    "state": progressInfo.state,
-                    "progress": Int(progressInfo.percentage),
-                    "bytesDownloaded": progressInfo.downloadedBytes,
-                    "totalBytes": progressInfo.totalBytes,
-                    "formattedDownloaded": formatBytes(progressInfo.downloadedBytes),
-                    "formattedTotal": formatBytes(progressInfo.totalBytes),
-                    "isCompleted": false
-                ])
-            }
+            allDownloads.append([
+                "downloadId": downloadId,
+                "state": progressInfo.state,
+                "progress": Int(progressInfo.percentage),
+                "bytesDownloaded": progressInfo.downloadedBytes,
+                "totalBytes": progressInfo.totalBytes,
+                "formattedDownloaded": formatBytes(progressInfo.downloadedBytes),
+                "formattedTotal": formatBytes(progressInfo.totalBytes),
+                "isCompleted": progressInfo.state == "completed"
+            ])
         }
-        
-        // Add incomplete downloads
+
+        for download in registeredDownloads {
+            guard let downloadId = download["downloadId"] as? String else { continue }
+
+            if allDownloads.contains(where: { ($0["downloadId"] as? String) == downloadId }) {
+                continue
+            }
+
+            let fileCheck = offlineRegistry.checkFileExists(downloadId: downloadId)
+            guard fileCheck.exists else { continue }
+
+            var downloadInfo = download
+            downloadInfo["downloadId"] = downloadId
+            downloadInfo["state"] = "completed"
+            downloadInfo["progress"] = 100
+            downloadInfo["isCompleted"] = true
+            allDownloads.append(downloadInfo)
+        }
+
         for downloadId in incompleteDownloads {
             if !allDownloads.contains(where: { ($0["downloadId"] as? String) == downloadId }) {
                 allDownloads.append([
@@ -1272,7 +1331,7 @@ class VideoDownloadManager: NSObject {
                 ])
             }
         }
-        
+
         resolver(allDownloads)
     }
 
@@ -1281,13 +1340,18 @@ class VideoDownloadManager: NSObject {
         if let trackInfo = getStoredTrackInfo(for: downloadId) {
             return trackInfo.actualSizeBytes
         }
-        
+
+        if let expected = getExpectedSizeForDownload(downloadId: downloadId) {
+            return expected
+        }
+
         if let progressInfo = downloadProgress[downloadId] {
             return progressInfo.totalBytes
         }
-        
+
         return 0
     }
+
     
     private func getFileSize(at url: URL) -> Int64 {
         do {
@@ -2064,8 +2128,35 @@ class VideoDownloadManager: NSObject {
         resolver: @escaping RCTPromiseResolveBlock,
         rejecter: @escaping RCTPromiseRejectBlock
     ) {
-        // Check if it's a completed download
+        if let progressInfo = downloadProgress[downloadId] {
+            resolver([
+                "downloadId": downloadId,
+                "state": progressInfo.state,
+                "progress": Int(progressInfo.percentage),
+                "bytesDownloaded": progressInfo.downloadedBytes,
+                "totalBytes": progressInfo.totalBytes,
+                "isCompleted": progressInfo.state == "completed"
+            ])
+            return
+        }
+
+        if incompleteDownloads.contains(downloadId) {
+            resolver([
+                "downloadId": downloadId,
+                "state": "stopped",
+                "progress": 0,
+                "isCompleted": false
+            ])
+            return
+        }
+
         if let localUrl = offlineRegistry.getLocalUrl(for: downloadId) {
+            let fileCheck = offlineRegistry.checkFileExists(downloadId: downloadId)
+            guard fileCheck.exists else {
+                rejecter("DOWNLOAD_NOT_FOUND", "Download file missing for: \(downloadId)", nil)
+                return
+            }
+
             resolver([
                 "downloadId": downloadId,
                 "uri": localUrl.absoluteString,
@@ -2075,19 +2166,8 @@ class VideoDownloadManager: NSObject {
             ])
             return
         }
-        
-        // Check if it's an active download
-        if let progressInfo = downloadProgress[downloadId] {
-            resolver([
-                "downloadId": downloadId,
-                "state": progressInfo.state,
-                "progress": Int(progressInfo.percentage),
-                "bytesDownloaded": progressInfo.downloadedBytes,
-                "isCompleted": progressInfo.state == "completed"
-            ])
-        } else {
-            rejecter("DOWNLOAD_NOT_FOUND", "Download not found: \(downloadId)", nil)
-        }
+
+        rejecter("DOWNLOAD_NOT_FOUND", "Download not found: \(downloadId)", nil)
     }
 
     func checkStorageSpace(
