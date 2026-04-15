@@ -8,6 +8,7 @@ declare module "react-native-offline-video-downloader" {
     quality: string;
     trackId?: string;
     codecs?: string; // e.g., "avc1.640028" for H.264
+    codecFamily?: "hevc" | "h264" | "other";
     streamType?: string; // "SEPARATE_AUDIO_VIDEO" or "MUXED"
   }
 
@@ -29,10 +30,24 @@ declare module "react-native-offline-video-downloader" {
     streamType?: string; // "SEPARATE_AUDIO_VIDEO" or "MUXED"
     allowedQualities?: number[]; // e.g., [480, 720, 1080]
     availableQualityCount?: number;
+    deviceHevcHardwareDecodeSupported?: boolean;
+    devicePreferredDownloadCodec?: "hevc" | "h264";
+  }
+
+  export interface VideoCodecDownloadPreference {
+    preferredCodec: "hevc" | "h264";
+    hevcHardwareDecodeSupported: boolean;
+    platform: "ios" | "android";
   }
 
   export interface DownloadOptions {
     headers?: Record<string, string>;
+    /** Android: batch key shared by all episodes in a show download */
+    batchId?: string;
+    batchTotal?: number;
+    showTitle?: string;
+    episodeTitle?: string;
+    posterUri?: string;
   }
 
   export type DownloadState =
@@ -146,6 +161,7 @@ declare module "react-native-offline-video-downloader" {
       masterUrl: string,
       options?: DownloadOptions
     ): Promise<AvailableTracksResult>;
+    static getVideoCodecDownloadPreference(): Promise<VideoCodecDownloadPreference>;
     // Storage management
     static checkStorageSpace(): Promise<StorageInfo>;
     static canDownloadContent(
@@ -153,7 +169,7 @@ declare module "react-native-offline-video-downloader" {
     ): Promise<DownloadCapabilityCheck>;
 
     // Download management
-    static dowloadStream(
+    static downloadStream(
       masterUrl: string,
       downloadId: string,
       selectedHeight: number,

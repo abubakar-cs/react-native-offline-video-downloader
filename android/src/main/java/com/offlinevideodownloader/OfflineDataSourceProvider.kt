@@ -2,6 +2,7 @@ package com.offlinevideodownloader
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.net.Uri
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultDataSource
@@ -34,6 +35,50 @@ class OfflineDataSourceProvider(private val context: Context) {
         fun cleanup() {
             instanceRef?.clear()
             instanceRef = null
+        }
+
+        /**
+         * Detects when the URL passed to the player refers to the same Media3 offline download
+         * as [storedRequestUri] (Exo download request). Mux playback IDs are not 24-char hex,
+         * so equality / legacy hex matching alone often misses and the player falls back to HTTP.
+         */
+        fun playbackUrisReferToSameOfflineAsset(storedRequestUri: String, playerUri: String): Boolean {
+            val a = storedRequestUri.trim()
+            val b = playerUri.trim()
+            if (a == b) return true
+            val baseA = stripQueryAndFragment(a).trimEnd('/')
+            val baseB = stripQueryAndFragment(b).trimEnd('/')
+            if (baseA == baseB) return true
+            val muxA = muxStreamKeyFromUri(a)
+            val muxB = muxStreamKeyFromUri(b)
+            if (muxA.isNotEmpty() && muxA == muxB) return true
+            val hexA = extractHexLikeId(a)
+            val hexB = extractHexLikeId(b)
+            return hexA.isNotEmpty() && hexA == hexB
+        }
+
+        private fun stripQueryAndFragment(s: String): String {
+            val noFrag = s.substringBefore("#")
+            return noFrag.substringBefore("?")
+        }
+
+        private fun muxStreamKeyFromUri(uriString: String): String {
+            return try {
+                val u = Uri.parse(uriString)
+                val host = u.host?.lowercase() ?: return ""
+                if (!host.contains("mux.com")) return ""
+                val path = u.path?.trim('/') ?: return ""
+                if (path.isEmpty()) return ""
+                val firstSeg = path.substringBefore('/')
+                firstSeg.removeSuffix(".m3u8").removeSuffix(".m3u")
+            } catch (_: Exception) {
+                ""
+            }
+        }
+
+        private fun extractHexLikeId(url: String): String {
+            Regex("([a-f0-9]{32})").find(url)?.value?.let { return it }
+            return Regex("([a-f0-9]{24})").find(url)?.value ?: ""
         }
     }
 
@@ -86,9 +131,9 @@ class OfflineDataSourceProvider(private val context: Context) {
 
                         if (download.state == Download.STATE_COMPLETED) {
                             val downloadUri = download.request.uri.toString()
-
-                            if (downloadUri == uri || extractContentId(downloadUri) == extractContentId(
-                                    uri
+                            if (OfflineDataSourceProvider.playbackUrisReferToSameOfflineAsset(
+                                    downloadUri,
+                                    uri,
                                 )
                             ) {
                                 foundMatch = true
@@ -111,17 +156,6 @@ class OfflineDataSourceProvider(private val context: Context) {
             } catch (e: Exception) {
                 Log.w(TAG, "Warning: Error closing cursor: ${e.message}")
             }
-        }
-    }
-
-    private fun extractContentId(url: String): String {
-        return try {
-            val regex = Regex("([a-f0-9]{24})")
-            val match = regex.find(url)
-            val contentId = match?.value ?: ""
-            contentId
-        } catch (e: Exception) {
-            ""
         }
     }
 

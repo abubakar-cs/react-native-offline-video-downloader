@@ -2,6 +2,7 @@ package com.offlinevideodownloader
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.media.MediaCodecList
 import android.os.Handler
 import android.os.Looper
 import androidx.media3.common.C
@@ -24,12 +25,15 @@ import kotlinx.coroutines.*
 import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import java.io.BufferedReader
+import java.nio.charset.StandardCharsets
+import org.json.JSONObject
 import java.io.File
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.ln
 import kotlin.math.log10
 import kotlin.math.pow
@@ -42,7 +46,20 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
     private val progressHandler = Handler(Looper.getMainLooper())
     private val activeDownloads = mutableMapOf<String, Runnable>()
 
+    /** Guard `cachedSizes` — parallel `getAvailableTracks` can otherwise corrupt or mis-size. */
+    private val cachedSizesLock = Any()
     private val cachedSizes = mutableMapOf<String, Long>()
+
+    /** Full `MediaCodecList` scan is expensive; never repeat on the UI thread after first success. */
+    @Volatile
+    private var hevcDecoderSupportedCached: Boolean? = null
+
+    /** Single-threaded: HEVC probe + `getVideoCodecDownloadPreference` (avoid blocking RN / main). */
+    private val codecQueryExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "OfflineDownloader-codec").apply { isDaemon = true }
+    }
+
+    private val hevcWarmupStarted = AtomicBoolean(false)
 
     private val storedTrackIdentifiers = mutableMapOf<String, Map<Int, TrackIdentifier>>()
 
@@ -61,6 +78,8 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
 
     companion object {
         private const val MODULE_NAME = "OfflineVideoDownloader"
+        /** Media3 `DownloadManager` parallel download cap + matching downloader thread pool size. */
+        private const val MAX_PARALLEL_DOWNLOADS = 3
         private var _downloadManager: DownloadManager? = null
 
         @Volatile
@@ -101,12 +120,13 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                     .setUpstreamDataSourceFactory(upstreamDataSourceFactory)
                     .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
-                val downloadExecutor: Executor = Executors.newFixedThreadPool(3)
+                val downloadExecutor: Executor =
+                    Executors.newFixedThreadPool(MAX_PARALLEL_DOWNLOADS)
                 val downloaderFactory = DefaultDownloaderFactory(cacheDataSourceFactory, downloadExecutor)
 
                 val manager = DownloadManager(context, downloadIndex, downloaderFactory).apply {
                     requirements = Requirements(Requirements.NETWORK)
-                    maxParallelDownloads = 3
+                    maxParallelDownloads = MAX_PARALLEL_DOWNLOADS
                     // Don't add listener here - will be added when React is ready
                 }
 
@@ -121,6 +141,15 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
 
     init {
         initializeDownloadManager()
+        // Warm HEVC capability off the main thread so the first `getAvailableTracks` / UI path is cheaper.
+        if (hevcWarmupStarted.compareAndSet(false, true)) {
+            codecQueryExecutor.execute {
+                try {
+                    isHevcDecoderSupported()
+                } catch (_: Exception) {
+                }
+            }
+        }
     }
 
     override fun getName(): String = MODULE_NAME
@@ -195,7 +224,9 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
     fun getAvailableTracks(masterUrl: String, options: ReadableMap?, promise: Promise) {
         mainHandler.post {
             try {
-                cachedSizes.clear()
+                synchronized(cachedSizesLock) {
+                    cachedSizes.clear()
+                }
                 val context = reactApplicationContext
                 val headers = extractHeadersFromOptions(options)
                 val mediaItem = MediaItem.fromUri(masterUrl)
@@ -215,6 +246,10 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                             try {
                                 val streamType = detectStreamType(helper)
                                 val allowedQualities = setOf(480, 720, 1080)
+                                val (manifestHasHevc, manifestHasAvc) = scanManifestVideoCodecPresence(helper)
+                                val preferHevc = withContext(Dispatchers.Default) {
+                                    isHevcDecoderSupported()
+                                }
 
                                 val videoTrackMap = mutableMapOf<Int, WritableMap>()
                                 val videoBitrateMap = mutableMapOf<Int, Int>()
@@ -251,6 +286,16 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                                                         // ⚠️ FILTER OUT DOLBY VISION
                                                         if (isDolbyVisionFormat(format)) {
                                                             Log.d(MODULE_NAME, "Skipping Dolby Vision track: ${format.height}p, codec: ${format.codecs}")
+                                                            continue
+                                                        }
+
+                                                        if (!shouldIncludeVideoFormatForDownload(
+                                                                format,
+                                                                preferHevc,
+                                                                manifestHasHevc,
+                                                                manifestHasAvc,
+                                                            )
+                                                        ) {
                                                             continue
                                                         }
 
@@ -299,6 +344,14 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                                                                         putString("quality", "${format.height}p")
                                                                         putString("streamType", streamType.name)
                                                                         putString("codecs", format.codecs)
+                                                                        putString(
+                                                                            "codecFamily",
+                                                                            when {
+                                                                                isHevcFormat(format) -> "hevc"
+                                                                                isAvcFormat(format) -> "h264"
+                                                                                else -> "other"
+                                                                            },
+                                                                        )
                                                                     }
 
                                                                     videoTrackMap[format.height] = trackData
@@ -397,6 +450,11 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                                         allowedQualities.forEach { pushInt(it) }
                                     })
                                     putInt("availableQualityCount", videoTrackMap.size)
+                                    putBoolean("deviceHevcHardwareDecodeSupported", preferHevc)
+                                    putString(
+                                        "devicePreferredDownloadCodec",
+                                        if (preferHevc) "hevc" else "h264",
+                                    )
                                 })
 
                             } catch (e: Exception) {
@@ -429,6 +487,109 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                 codecs.contains("dav1") || // Dolby Vision AV1
                 codecs.contains("dvav") || // Dolby Vision AV1
                 format.colorInfo?.colorTransfer == C.COLOR_TRANSFER_ST2084
+    }
+
+    private fun isHevcDecoderSupported(): Boolean {
+        hevcDecoderSupportedCached?.let { return it }
+        return synchronized(this) {
+            hevcDecoderSupportedCached?.let { return@synchronized it }
+            val supported = try {
+                val list = MediaCodecList(MediaCodecList.ALL_CODECS)
+                var found = false
+                for (info in list.codecInfos) {
+                    if (info.isEncoder) continue
+                    for (t in info.supportedTypes) {
+                        if (t.equals("video/hevc", ignoreCase = true)) {
+                            found = true
+                            break
+                        }
+                    }
+                    if (found) break
+                }
+                found
+            } catch (_: Exception) {
+                false
+            }
+            hevcDecoderSupportedCached = supported
+            supported
+        }
+    }
+
+    private fun isHevcFormat(format: Format): Boolean {
+        val mime = format.sampleMimeType?.lowercase() ?: ""
+        if (mime.contains("hevc")) return true
+        val codecs = format.codecs?.lowercase() ?: ""
+        // SDR/PQ HEVC in HLS; exclude Dolby Vision code points (handled by isDolbyVisionFormat).
+        return codecs.contains("hvc1") || codecs.contains("hev1")
+    }
+
+    private fun isAvcFormat(format: Format): Boolean {
+        val mime = format.sampleMimeType?.lowercase() ?: ""
+        if (mime.contains("avc")) return true
+        val codecs = format.codecs?.lowercase() ?: ""
+        return codecs.contains("avc1") || codecs.contains("avc3")
+    }
+
+    private fun scanManifestVideoCodecPresence(helper: DownloadHelper): Pair<Boolean, Boolean> {
+        var hasHevc = false
+        var hasAvc = false
+        try {
+            for (periodIndex in 0 until helper.periodCount) {
+                val mappedTrackInfo = helper.getMappedTrackInfo(periodIndex)
+                for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
+                    if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_VIDEO) continue
+                    val trackGroups = mappedTrackInfo.getTrackGroups(rendererIndex)
+                    for (groupIndex in 0 until trackGroups.length) {
+                        val group = trackGroups.get(groupIndex)
+                        for (trackIndex in 0 until group.length) {
+                            val format = group.getFormat(trackIndex)
+                            if (isDolbyVisionFormat(format)) continue
+                            if (isHevcFormat(format)) hasHevc = true
+                            if (isAvcFormat(format)) hasAvc = true
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return Pair(hasHevc, hasAvc)
+    }
+
+    private fun shouldIncludeVideoFormatForDownload(
+        format: Format,
+        preferHevc: Boolean,
+        manifestHasHevc: Boolean,
+        manifestHasAvc: Boolean,
+    ): Boolean {
+        if (isDolbyVisionFormat(format)) return false
+        val hevc = isHevcFormat(format)
+        val avc = isAvcFormat(format)
+        if (preferHevc) {
+            if (manifestHasHevc) return hevc
+            return avc || !hevc
+        } else {
+            if (manifestHasAvc) return avc
+            return hevc || !avc
+        }
+    }
+
+    @ReactMethod
+    fun getVideoCodecDownloadPreference(promise: Promise) {
+        codecQueryExecutor.execute {
+            try {
+                val hevc = isHevcDecoderSupported()
+                val map = Arguments.createMap().apply {
+                    putBoolean("hevcHardwareDecodeSupported", hevc)
+                    putString("preferredCodec", if (hevc) "hevc" else "h264")
+                    putString("platform", "android")
+                }
+                mainHandler.post { promise.resolve(map) }
+            } catch (e: Exception) {
+                mainHandler.post {
+                    promise.reject("CODEC_QUERY_ERROR", e.message, e)
+                }
+            }
+        }
     }
 
     @ReactMethod
@@ -491,7 +652,8 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                                 selectFallbackByResolution(helper, selectedWidth, selectedHeight)
                             }
 
-                            val downloadRequest = helper.getDownloadRequest(downloadId, null)
+                            val metaBytes = buildDownloadNotificationMetaBytes(options)
+                            val downloadRequest = helper.getDownloadRequest(downloadId, metaBytes)
 
                             validateDownloadRequest(downloadRequest, streamType)
 
@@ -813,9 +975,8 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
             try {
 
                 val cacheKey = "${format.height}p_${format.bitrate}_${streamType.name}"
-                cachedSizes[cacheKey]?.let { cachedSize ->
-                    return@withContext cachedSize
-                }
+                val cacheHit = synchronized(cachedSizesLock) { cachedSizes[cacheKey] }
+                cacheHit?.let { return@withContext it }
 
                 val allowedQualities = setOf(480, 720, 1080)
                 if (format.height !in allowedQualities) {
@@ -837,7 +998,9 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
 
                     if (videoSampleSize > 0) {
                         val totalSize = videoSampleSize + audioSampleSize
-                        cachedSizes[cacheKey] = totalSize
+                        synchronized(cachedSizesLock) {
+                            cachedSizes[cacheKey] = totalSize
+                        }
                         return@withContext totalSize
                     }
                 }
@@ -847,7 +1010,9 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                     StreamType.MUXED_VIDEO_AUDIO -> calculateMuxedStreamSize(adjustedBitrate, durationSec)
                     StreamType.UNKNOWN -> calculateVideoOnlySize(adjustedBitrate, durationSec)
                 }
-                cachedSizes[cacheKey] = calculatedSize
+                synchronized(cachedSizesLock) {
+                    cachedSizes[cacheKey] = calculatedSize
+                }
                 calculatedSize
 
             } catch (e: Exception) {
@@ -1206,11 +1371,22 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
         }
     }
 
+    /** Prefer in-memory list, then persisted index — matches how [getOfflinePlaybackUri] resolves downloads. */
+    private fun findDownloadById(downloadId: String): Download? {
+        val dm = _downloadManager ?: return null
+        dm.currentDownloads.find { it.request.id == downloadId }?.let { return it }
+        return try {
+            dm.downloadIndex.getDownload(downloadId)
+        } catch (e: Exception) {
+            Log.w(MODULE_NAME, "downloadIndex.getDownload($downloadId): ${e.message}")
+            null
+        }
+    }
+
     @ReactMethod
     fun getOfflinePlaybackUri(downloadId: String, promise: Promise) {
         try {
-            val downloadManager = _downloadManager
-            val download = downloadManager?.downloadIndex?.getDownload(downloadId)
+            val download = findDownloadById(downloadId)
 
             if (download == null) {
                 promise.reject("NOT_FOUND", "Download not found: $downloadId")
@@ -1260,7 +1436,7 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
     @ReactMethod
     fun getDownloadStatus(downloadId: String, promise: Promise) {
         try {
-            val download = _downloadManager?.currentDownloads?.find { it.request.id == downloadId }
+            val download = findDownloadById(downloadId)
 
             if (download != null) {
                 val progress = download.percentDownloaded.roundToInt()
@@ -1418,7 +1594,7 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
         val progressRunnable = object : Runnable {
             override fun run() {
                 try {
-                    val download = _downloadManager?.currentDownloads?.find { it.request.id == downloadId }
+                    val download = findDownloadById(downloadId)
                     if (download != null && download.state == Download.STATE_DOWNLOADING) {
                         sendProgressEvent(download)
                         progressHandler.postDelayed(this, 1000)
@@ -1446,9 +1622,8 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                 return
             }
 
-            if (!reactApplicationContext.hasCatalystInstance()) {
-                return
-            }
+            // Do not gate on hasCatalystInstance(): it is false in bridgeless / New Architecture,
+            // which would suppress all DownloadProgress events while downloads still run natively.
 
             val progress = download.percentDownloaded.roundToInt()
             val state = getDownloadStateString(download.state)
@@ -1519,6 +1694,52 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
             headersMap.getString(key)?.let { value -> headers[key] = value }
         }
         return headers.ifEmpty { null }
+    }
+
+    /** JSON in DownloadRequest.data for [VideoDownloadService.resolveCurrentBatchProgress]. */
+    private fun readStringOption(options: ReadableMap, key: String): String {
+        if (!options.hasKey(key) || options.isNull(key)) return ""
+        return try {
+            options.getString(key)?.trim().orEmpty()
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    private fun readIntOption(options: ReadableMap, key: String, default: Int = 0): Int {
+        if (!options.hasKey(key) || options.isNull(key)) return default
+        return try {
+            when (options.getType(key)) {
+                ReadableType.Number -> options.getDouble(key).roundToInt()
+                ReadableType.String -> options.getString(key)?.toIntOrNull() ?: default
+                else -> default
+            }
+        } catch (_: Exception) {
+            default
+        }
+    }
+
+    private fun buildDownloadNotificationMetaBytes(options: ReadableMap?): ByteArray? {
+        if (options == null) return null
+        val batchId = readStringOption(options, "batchId")
+        if (batchId.isEmpty()) return null
+        val batchTotal = readIntOption(options, "batchTotal", 0)
+        if (batchTotal <= 0) return null
+        return try {
+            val obj = JSONObject()
+            obj.put("batchId", batchId)
+            obj.put("batchTotal", batchTotal)
+            val showTitle = readStringOption(options, "showTitle")
+            if (showTitle.isNotEmpty()) obj.put("showTitle", showTitle)
+            val episodeTitle = readStringOption(options, "episodeTitle")
+            if (episodeTitle.isNotEmpty()) obj.put("episodeTitle", episodeTitle)
+            val posterUri = readStringOption(options, "posterUri")
+            if (posterUri.isNotEmpty()) obj.put("posterUri", posterUri)
+            obj.toString().toByteArray(StandardCharsets.UTF_8)
+        } catch (e: Exception) {
+            Log.w(MODULE_NAME, "buildDownloadNotificationMetaBytes: ${e.message}")
+            null
+        }
     }
 
     @SuppressLint("DefaultLocale")

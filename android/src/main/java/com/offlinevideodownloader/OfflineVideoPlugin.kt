@@ -341,8 +341,13 @@ class OfflineVideoPlugin : RNVExoplayerPlugin {
                 try {
                     while (downloadsCursor.moveToNext()) {
                         val download = downloadsCursor.download
-                        if (download.request.uri.toString() == uri &&
-                            download.state == Download.STATE_COMPLETED) {
+                        val requestUri = download.request.uri.toString()
+                        if (download.state == Download.STATE_COMPLETED &&
+                            OfflineDataSourceProvider.playbackUrisReferToSameOfflineAsset(
+                                requestUri,
+                                uri,
+                            )
+                        ) {
                             streamKeys = download.request.streamKeys
                             break
                         }

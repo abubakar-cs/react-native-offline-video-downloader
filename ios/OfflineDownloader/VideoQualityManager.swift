@@ -1,7 +1,26 @@
 import AVFoundation
 import Foundation
+import VideoToolbox
 
 class VideoQualityManager {
+    
+    /// `true` when this device can hardware-decode HEVC (aligns with choosing an HEVC download renditions).
+    static func isHevcHardwareDecodeSupported() -> Bool {
+        if #available(iOS 11.0, *) {
+            return VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
+        }
+        return false
+    }
+    
+    func isHevcVariant(_ variant: AVAssetVariant) -> Bool {
+        guard let videoAttributes = variant.videoAttributes else { return false }
+        return videoAttributes.codecTypes.contains { $0 == kCMVideoCodecType_HEVC }
+    }
+    
+    func isH264Variant(_ variant: AVAssetVariant) -> Bool {
+        guard let videoAttributes = variant.videoAttributes else { return false }
+        return videoAttributes.codecTypes.contains { $0 == kCMVideoCodecType_H264 }
+    }
     
     func analyzeQualities(for asset: AVURLAsset) -> [[String: Any]] {
         var qualities: [[String: Any]] = []

@@ -41,23 +41,29 @@ class OfflineVideoRegistry {
     
     func removeDownload(downloadId: String, completion: @escaping (Bool, String?) -> Void) {
         registryQueue.async(flags: .barrier) {
-            guard let localUrl = self.getLocalUrlUnsafe(for: downloadId) else {
-                DispatchQueue.main.async {
-                    completion(false, "Download not found in registry")
-                }
-                return
+            let registry = self.getRegistryUnsafe()
+            var localUrl: URL?
+
+            if let data = registry[downloadId],
+               let urlString = data["localUrl"] as? String,
+               let url = URL(string: urlString) {
+                localUrl = url
+            } else if let resolved = self.getLocalUrlUnsafe(for: downloadId) {
+                localUrl = resolved
             }
-            
-            if FileManager.default.fileExists(atPath: localUrl.path) {
+
+            if let url = localUrl, FileManager.default.fileExists(atPath: url.path) {
                 do {
-                    try FileManager.default.removeItem(at: localUrl)
+                    try FileManager.default.removeItem(at: url)
                 } catch {
                     print("Failed to remove file (continuing): \(error)")
                 }
             }
-            
+
+            // Always drop the registry row for this id so UI cannot show "downloaded" after delete/cancel
+            // when the file is already gone or the URL string no longer parses.
             self.removeFromRegistryUnsafe(downloadId: downloadId)
-            
+
             DispatchQueue.main.async {
                 completion(true, nil)
             }

@@ -82,6 +82,9 @@ RCT_EXTERN_METHOD(setPlaybackMode:(NSString *)mode
 RCT_EXTERN_METHOD(getPlaybackMode:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 
+RCT_EXTERN_METHOD(getVideoCodecDownloadPreference:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+
 + (BOOL)requiresMainQueueSetup
 {
   return YES;

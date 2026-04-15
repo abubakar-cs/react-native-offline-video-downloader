@@ -287,4 +287,15 @@ class OfflineVideoDownloader: RCTEventEmitter {
             rejecter: rejecter
         )
     }
+
+    @objc(getVideoCodecDownloadPreference:rejecter:)
+    func getVideoCodecDownloadPreference(
+        _ resolver: @escaping RCTPromiseResolveBlock,
+        rejecter: @escaping RCTPromiseRejectBlock
+    ) {
+        videoDownloadManager.getVideoCodecDownloadPreference(
+            resolver: resolver,
+            rejecter: rejecter
+        )
+    }
 }

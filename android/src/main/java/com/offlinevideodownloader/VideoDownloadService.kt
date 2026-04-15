@@ -3,31 +3,145 @@ package com.offlinevideodownloader
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.content.Context
 import android.os.Build
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.media3.common.util.Log
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.offline.Download
+import androidx.media3.exoplayer.offline.DownloadCursor
 import androidx.media3.exoplayer.offline.DownloadManager
 import androidx.media3.exoplayer.offline.DownloadService
 import androidx.media3.exoplayer.scheduler.PlatformScheduler
 import androidx.media3.exoplayer.scheduler.Scheduler
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.charset.StandardCharsets
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import kotlin.math.roundToInt
+import org.json.JSONObject
 
 @UnstableApi
 class VideoDownloadService : DownloadService(
+    /** Single slot: progress while downloading, then “Downloaded” (user-dismissible) on same id. */
     FOREGROUND_NOTIFICATION_ID,
-    DEFAULT_FOREGROUND_NOTIFICATION_UPDATE_INTERVAL,
+    /* Extra delayed refresh only; Media3 still refreshes on each download event. */
+    15_000L,
     CHANNEL_ID,
     R.string.download_channel_name,
-    R.string.download_channel_description
+    R.string.download_channel_description,
 ) {
+    data class NotificationMeta(
+        val batchId: String = "",
+        val batchTotal: Int = 0,
+        val showTitle: String = "",
+        val episodeTitle: String = "",
+        val posterUri: String = ""
+    )
+
+    data class BatchProgress(
+        val batchId: String,
+        val showTitle: String,
+        val posterUri: String,
+        val totalEpisodes: Int,
+        val completedEpisodes: Int,
+        val failedEpisodes: Int,
+        val aggregateProgress: Int
+    )
+
     companion object {
         private const val TAG = "VideoDownloadService"
+        /** FGS + same id after stop so the tile persists as “Downloaded” until the user dismisses it. */
         private const val FOREGROUND_NOTIFICATION_ID = 1
-        private const val CHANNEL_ID = "VideoDownloadChannel"
+        /** One slot for failed episode notifications (replaced if another fails). */
+        private const val DOWNLOAD_FAILED_NOTIFICATION_ID = 57002
+        private const val FG_NOTIFICATION_MIN_REBUILD_INTERVAL_MS = 4_000L
+        private const val AGGREGATE_QUANTUM_PERCENT = 5
+        /** New id so devices pick up IMPORTANCE_DEFAULT (O+ won’t upgrade an old LOW channel). */
+        private const val CHANNEL_ID = "scrolls_offline_show_downloads"
         private const val JOB_ID = 1001
+        /** HTTP poster fetch must not run on the main thread (NetworkOnMainThreadException). */
+        private val posterHttpExecutor = Executors.newSingleThreadExecutor()
+        private const val POSTER_HTTP_TIMEOUT_MS = 12_000
+        private const val NOTIFICATION_ICON_MAX_PX = 320
+        private val posterBitmapCache = ConcurrentHashMap<String, Bitmap>()
+        private const val POSTER_CACHE_MAX_ENTRIES = 8
+        /** One async HTTP fetch per URL — avoids stacked futures and icon flicker. */
+        private val httpPosterInflight =
+            Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
     }
+
+    private var fgCachedNotification: Notification? = null
+    private var fgCacheKey: String = ""
+    private var fgCachedAtElapsed: Long = 0L
+
+    /** When Media3 passes an empty list, keep batch UI until the index no longer contains the batch. */
+    private var lastStableBatchProgress: BatchProgress? = null
+
+    /**
+     * Last large icon we actually showed for this poster URL. HTTP loads are async; reusing avoids
+     * large-icon flicker between ticks.
+     */
+    private var stickyPosterUri: String = ""
+    private var stickyPosterBitmap: Bitmap? = null
+
+    private fun clearStickyPoster() {
+        stickyPosterUri = ""
+        stickyPosterBitmap = null
+    }
+
+    private fun invalidateForegroundNotificationCache() {
+        fgCachedNotification = null
+        fgCacheKey = ""
+        fgCachedAtElapsed = 0L
+    }
+
+    private fun fgCacheKeyDownloading(bp: BatchProgress): String {
+        val q =
+            (bp.aggregateProgress.coerceIn(0, 100) / AGGREGATE_QUANTUM_PERCENT) * AGGREGATE_QUANTUM_PERCENT
+        return "d|${bp.batchId}|${bp.completedEpisodes}|${bp.totalEpisodes}|$q"
+    }
+
+    private fun fgCacheKeyComplete(bp: BatchProgress): String =
+        "c|${bp.batchId}|${bp.totalEpisodes}|${bp.completedEpisodes}"
+
+    private fun foregroundNotificationCached(key: String, build: () -> Notification): Notification {
+        val now = SystemClock.elapsedRealtime()
+        val cached = fgCachedNotification
+        if (cached != null &&
+            key == fgCacheKey &&
+            now - fgCachedAtElapsed < FG_NOTIFICATION_MIN_REBUILD_INTERVAL_MS
+        ) {
+            return cached
+        }
+        val n = build()
+        fgCacheKey = key
+        fgCachedAtElapsed = now
+        fgCachedNotification = n
+        return n
+    }
+
+    private val terminalNotificationListener =
+        object : DownloadManager.Listener {
+            override fun onDownloadChanged(
+                manager: DownloadManager,
+                download: Download,
+                finalException: Exception?,
+            ) {
+                if (download.state != Download.STATE_FAILED) return
+                try {
+                    notifyDownloadFailed(download, finalException)
+                } catch (e: Exception) {
+                    Log.w(TAG, "notifyDownloadFailed: ${e.message}")
+                }
+            }
+        }
 
     override fun onCreate() {
         super.onCreate()
@@ -40,6 +154,11 @@ class VideoDownloadService : DownloadService(
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to initialize DownloadManager in service", e)
             }
+        }
+        try {
+            getDownloadManager().addListener(terminalNotificationListener)
+        } catch (e: Exception) {
+            Log.w(TAG, "addListener terminalNotificationListener: ${e.message}")
         }
     }
 
@@ -59,6 +178,38 @@ class VideoDownloadService : DownloadService(
         return manager ?: throw IllegalStateException("DownloadManager could not be initialized")
     }
 
+    override fun onDestroy() {
+        try {
+            getDownloadManager().removeListener(terminalNotificationListener)
+        } catch (_: Exception) {
+        }
+        var completedBatch: BatchProgress? = null
+        try {
+            val bp = resolveCurrentBatchProgress(emptyList())
+            if (bp != null &&
+                bp.totalEpisodes > 0 &&
+                bp.completedEpisodes >= bp.totalEpisodes
+            ) {
+                completedBatch = bp
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "onDestroy batch snapshot: ${e.message}")
+        }
+        super.onDestroy()
+        if (completedBatch != null) {
+            try {
+                val nm =
+                    applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.notify(
+                    FOREGROUND_NOTIFICATION_ID,
+                    createBatchCompletedNotification(completedBatch),
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Persistent completed notification: ${e.message}")
+            }
+        }
+    }
+
     override fun getScheduler(): Scheduler? {
         return try {
             PlatformScheduler(this, JOB_ID)
@@ -70,53 +221,170 @@ class VideoDownloadService : DownloadService(
 
     override fun getForegroundNotification(
         downloads: List<Download>,
-        notMetRequirements: Int
+        notMetRequirements: Int,
     ): Notification {
-        return when {
-            downloads.isEmpty() -> {
-                createNotification("Video Downloader", "Ready for downloads")
-            }
-            else -> {
-                val activeDownloads = downloads.filter {
-                    it.state == Download.STATE_DOWNLOADING || it.state == Download.STATE_QUEUED
-                }
+        var batchProgress = resolveCurrentBatchProgress(downloads)
 
-                when {
-                    activeDownloads.isEmpty() -> {
-                        val completedCount = downloads.count { it.state == Download.STATE_COMPLETED }
-                        createNotification(
-                            "Downloads complete",
-                            "$completedCount video${if (completedCount != 1) "s" else ""} ready"
-                        )
-                    }
-                    activeDownloads.size == 1 -> {
-                        val download = activeDownloads.first()
-                        val progress = download.percentDownloaded.toInt()
-                        createProgressNotification("Downloading video...", "$progress% complete", progress)
-                    }
-                    else -> {
-                        val totalProgress = activeDownloads.map { it.percentDownloaded }.average().toInt()
-                        createProgressNotification(
-                            "Downloading ${activeDownloads.size} videos",
-                            "$totalProgress% overall",
-                            totalProgress
-                        )
+        // Never fall back to a **fully completed** snapshot — that was the previous show’s tile and
+        // masked the active download’s title / totals / poster for the next show.
+        if (batchProgress == null && lastStableBatchProgress != null) {
+            val stable = lastStableBatchProgress!!
+            if (!isTerminalBatchSnapshot(stable)) {
+                batchProgress = stable
+            }
+        }
+
+        if (batchProgress == null && lastStableBatchProgress != null) {
+            val sid = lastStableBatchProgress!!.batchId
+            if (downloadIndexContainsBatchId(sid)) {
+                batchProgress = resolveCurrentBatchProgress(emptyList())
+                if (batchProgress == null) {
+                    val stable = lastStableBatchProgress!!
+                    if (!isTerminalBatchSnapshot(stable)) {
+                        batchProgress = stable
                     }
                 }
             }
         }
+
+        if (batchProgress != null) {
+            val prevBatchId = lastStableBatchProgress?.batchId
+            if (prevBatchId != null && prevBatchId != batchProgress.batchId) {
+                clearStickyPoster()
+                invalidateForegroundNotificationCache()
+            }
+            lastStableBatchProgress = batchProgress
+
+            val isComplete =
+                batchProgress.totalEpisodes > 0 &&
+                    batchProgress.completedEpisodes >= batchProgress.totalEpisodes
+
+            if (isComplete) {
+                val done =
+                    batchProgress.copy(
+                        aggregateProgress = 100,
+                        completedEpisodes = batchProgress.totalEpisodes,
+                    )
+                // Drop completed batch from sticky FG state so the next download doesn’t inherit
+                // this show’s title, episode count, or poster on the following notification ticks.
+                lastStableBatchProgress = null
+                clearStickyPoster()
+                invalidateForegroundNotificationCache()
+                // Completed: new fingerprint → immediate rebuild; then stays stable on cache.
+                return foregroundNotificationCached(fgCacheKeyComplete(done)) {
+                    createBatchCompletedNotification(done)
+                }
+            }
+
+            lastStableBatchProgress = batchProgress
+            return foregroundNotificationCached(fgCacheKeyDownloading(batchProgress)) {
+                createBatchDownloadingNotification(batchProgress)
+            }
+        }
+
+        lastStableBatchProgress = null
+        clearStickyPoster()
+        invalidateForegroundNotificationCache()
+
+        return foregroundNotificationCached("g|preparing") {
+            createMinimalOngoingNotification(
+                "Downloading",
+                "Preparing offline save…",
+            )
+        }
+    }
+
+    private fun createMinimalOngoingNotification(title: String, text: String): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setProgress(0, 0, false)
+            .setOngoing(true)
+            .setSilent(true)
+            .setOnlyAlertOnce(true)
+            .setAutoCancel(false)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .build()
+    }
+
+    private fun createBatchDownloadingNotification(bp: BatchProgress): Notification {
+        val title = if (bp.showTitle.isNotBlank()) bp.showTitle else "Downloading"
+        val text = "${bp.completedEpisodes}/${bp.totalEpisodes} episodes · ${bp.aggregateProgress}%"
+        val builder =
+            NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setProgress(100, bp.aggregateProgress.coerceIn(0, 100), false)
+                .setOngoing(true)
+                .setAutoCancel(false)
+                .setSilent(true)
+                .setOnlyAlertOnce(true)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+                .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+        notificationLargeIcon(bp.posterUri)?.let { builder.setLargeIcon(it) }
+        return builder.build()
+    }
+
+    private fun notifyDownloadFailed(download: Download, cause: Exception?) {
+        val meta = parseNotificationMeta(download)
+        val title =
+            meta?.showTitle?.takeIf { it.isNotBlank() } ?: "Offline download"
+        val episode = meta?.episodeTitle?.takeIf { it.isNotBlank() }
+        val reason =
+            cause?.message?.takeIf { it.isNotBlank() }
+                ?: "Could not save this episode for offline playback."
+        val shortText =
+            if (episode != null) {
+                "$episode — $reason"
+            } else {
+                reason
+            }
+        val bigText =
+            buildString {
+                if (episode != null) {
+                    append(episode)
+                    append("\n\n")
+                }
+                append(reason)
+            }
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val builder =
+            NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle(title)
+                .setContentText(shortText)
+                .setStyle(
+                    NotificationCompat.BigTextStyle()
+                        .setBigContentTitle(title)
+                        .bigText(bigText),
+                )
+                .setSmallIcon(android.R.drawable.stat_sys_warning)
+                .setProgress(0, 0, false)
+                .setOngoing(false)
+                .setAutoCancel(true)
+                .setSilent(true)
+                .setOnlyAlertOnce(true)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .setCategory(NotificationCompat.CATEGORY_ERROR)
+        notificationLargeIcon(meta?.posterUri)?.let { builder.setLargeIcon(it) }
+        nm.notify(DOWNLOAD_FAILED_NOTIFICATION_ID, builder.build())
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Video Downloads",
-                NotificationManager.IMPORTANCE_LOW
+                "Show downloads",
+                NotificationManager.IMPORTANCE_DEFAULT,
             ).apply {
-                description = "Shows progress of video downloads"
+                description = "Offline download progress and completion for each show"
                 setSound(null, null)
                 enableVibration(false)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
 
             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -124,24 +392,310 @@ class VideoDownloadService : DownloadService(
         }
     }
 
-    private fun createNotification(title: String, text: String): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setOngoing(true)
-            .setSilent(true)
-            .build()
+    /**
+     * Entire show saved: same notification id as progress; not ongoing so the user can dismiss it.
+     * [setAutoCancel] false — only explicit dismiss clears it (no tap-to-clear unless you add a content intent).
+     */
+    private fun createBatchCompletedNotification(bp: BatchProgress): Notification {
+        val title = if (bp.showTitle.isNotBlank()) bp.showTitle else "Downloads"
+        val shortText = "✓ Downloaded"
+        val longText =
+            "All ${bp.completedEpisodes}/${bp.totalEpisodes} episodes saved for offline playback."
+        val builder =
+            NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle(title)
+                .setContentText(shortText)
+                .setStyle(
+                    NotificationCompat.BigTextStyle()
+                        .setBigContentTitle(title)
+                        .bigText(longText),
+                )
+                .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                .setProgress(0, 0, false)
+                .setOngoing(false)
+                .setAutoCancel(false)
+                .setSilent(true)
+                .setOnlyAlertOnce(true)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .setCategory(NotificationCompat.CATEGORY_STATUS)
+        notificationLargeIcon(bp.posterUri)?.let { builder.setLargeIcon(it) }
+        return builder.build()
     }
 
-    private fun createProgressNotification(title: String, text: String, progress: Int): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setOngoing(true)
-            .setSilent(true)
-            .setProgress(100, progress, progress == 0)
-            .build()
+    private fun downloadIndexContainsBatchId(batchId: String): Boolean {
+        if (batchId.isBlank()) return false
+        return try {
+            getDownloadManager().downloadIndex.getDownloads().use { c ->
+                while (c.moveToNext()) {
+                    val m = parseNotificationMeta(c.download) ?: continue
+                    if (m.batchId == batchId) return true
+                }
+                false
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Pick notification seed meta for the **current** work unit. The download index often lists
+     * older/completed shows first; using the first match caused the FG notification to keep showing
+     * the first show’s title, episode count, and poster after another show finished downloading.
+     */
+    private fun findSeededNotificationMeta(downloads: List<Download>): NotificationMeta? {
+        val hotStates =
+            setOf(
+                Download.STATE_QUEUED,
+                Download.STATE_DOWNLOADING,
+                Download.STATE_RESTARTING,
+            )
+
+        fun firstMetaWithBatch(list: Iterable<Download>): NotificationMeta? {
+            for (d in list) {
+                if (d.state !in hotStates) continue
+                val meta = parseNotificationMeta(d) ?: continue
+                if (meta.batchId.isNotBlank() && meta.batchTotal > 0) return meta
+            }
+            for (d in list) {
+                if (d.state != Download.STATE_STOPPED) continue
+                val meta = parseNotificationMeta(d) ?: continue
+                if (meta.batchId.isNotBlank() && meta.batchTotal > 0) return meta
+            }
+            for (d in list) {
+                val meta = parseNotificationMeta(d) ?: continue
+                if (meta.batchId.isNotBlank() && meta.batchTotal > 0) return meta
+            }
+            return null
+        }
+
+        firstMetaWithBatch(downloads)?.let { return it }
+
+        return try {
+            val all = ArrayList<Download>()
+            getDownloadManager().downloadIndex.getDownloads().use { c ->
+                while (c.moveToNext()) {
+                    all.add(c.download)
+                }
+            }
+            // Prefer newer index rows first so an in-flight show wins over an older completed row.
+            firstMetaWithBatch(all.asReversed())
+        } catch (e: Exception) {
+            Log.w(TAG, "findSeededNotificationMeta: ${e.message}")
+            null
+        }
+    }
+
+    private fun isTerminalBatchSnapshot(bp: BatchProgress): Boolean =
+        bp.totalEpisodes > 0 && bp.completedEpisodes >= bp.totalEpisodes
+
+    private fun resolveCurrentBatchProgress(downloads: List<Download>): BatchProgress? {
+        val seededMeta = findSeededNotificationMeta(downloads) ?: return null
+
+        val currentBatchId = seededMeta.batchId
+        val currentBatchTotal = seededMeta.batchTotal
+
+        val manager = getDownloadManager()
+        var completed = 0
+        var failed = 0
+        var progressAccumulator = 0f
+        var maxShowTitle = seededMeta.showTitle
+        var maxPosterUri = seededMeta.posterUri
+        var matched = 0
+
+        try {
+            val cursor: DownloadCursor = manager.downloadIndex.getDownloads()
+            cursor.use {
+                while (it.moveToNext()) {
+                    val d = it.download
+                    val meta = parseNotificationMeta(d) ?: continue
+                    if (meta.batchId != currentBatchId) continue
+                    matched += 1
+
+                    if (maxShowTitle.isBlank() && meta.showTitle.isNotBlank()) {
+                        maxShowTitle = meta.showTitle
+                    }
+                    if (maxPosterUri.isBlank() && meta.posterUri.isNotBlank()) {
+                        maxPosterUri = meta.posterUri
+                    }
+
+                    when (d.state) {
+                        Download.STATE_COMPLETED -> {
+                            completed += 1
+                            progressAccumulator += 100f
+                        }
+                        Download.STATE_FAILED -> {
+                            failed += 1
+                            progressAccumulator += 0f
+                        }
+                        Download.STATE_DOWNLOADING,
+                        Download.STATE_QUEUED,
+                        Download.STATE_RESTARTING,
+                        Download.STATE_STOPPED -> {
+                            val pct = if (d.percentDownloaded.isNaN() || d.percentDownloaded < 0f) 0f else d.percentDownloaded
+                            progressAccumulator += pct.coerceIn(0f, 100f)
+                        }
+                        else -> Unit
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Batch progress query failed: ${e.message}")
+            return null
+        }
+
+        val denominator = currentBatchTotal.coerceAtLeast(matched).coerceAtLeast(1)
+        val aggregate = (progressAccumulator / denominator).roundToInt().coerceIn(0, 100)
+
+        return BatchProgress(
+            batchId = currentBatchId,
+            showTitle = maxShowTitle,
+            posterUri = maxPosterUri,
+            totalEpisodes = denominator,
+            completedEpisodes = completed.coerceAtMost(denominator),
+            failedEpisodes = failed,
+            aggregateProgress = aggregate
+        )
+    }
+
+    private fun parseNotificationMeta(download: Download): NotificationMeta? {
+        val raw = download.request.data
+        if (raw == null || raw.isEmpty()) return null
+        return try {
+            val obj = JSONObject(String(raw, StandardCharsets.UTF_8))
+            NotificationMeta(
+                batchId = obj.optString("batchId", ""),
+                batchTotal = obj.optInt("batchTotal", 0),
+                showTitle = obj.optString("showTitle", ""),
+                episodeTitle = obj.optString("episodeTitle", ""),
+                posterUri = obj.optString("posterUri", "")
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "parseNotificationMeta failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun addPosterToCache(uri: String, decoded: Bitmap) {
+        if (decoded.isRecycled) return
+        while (posterBitmapCache.size >= POSTER_CACHE_MAX_ENTRIES) {
+            val drop = posterBitmapCache.keys.firstOrNull() ?: break
+            posterBitmapCache.remove(drop)
+        }
+        posterBitmapCache[uri] = decoded
+    }
+
+    private fun scheduleHttpPosterPrefetch(url: String) {
+        if (posterBitmapCache.containsKey(url)) return
+        if (!httpPosterInflight.add(url)) return
+        posterHttpExecutor.execute {
+            try {
+                val bmp = downloadPosterFromHttp(url) ?: return@execute
+                addPosterToCache(url, bmp)
+            } catch (e: Exception) {
+                Log.w(TAG, "Poster HTTP async: ${e.message}")
+            } finally {
+                httpPosterInflight.remove(url)
+            }
+        }
+    }
+
+    /**
+     * Large icon for notifications: never blocks on HTTP (that caused tray blinking when
+     * timeouts/null alternated with decoded bitmaps). Local paths decode synchronously.
+     */
+    private fun notificationLargeIcon(posterUri: String?): Bitmap? {
+        val value = posterUri?.trim().orEmpty()
+        if (value.isBlank()) return null
+
+        posterBitmapCache[value]?.let { cached ->
+            if (!cached.isRecycled) {
+                stickyPosterUri = value
+                stickyPosterBitmap = cached
+                return cached
+            }
+            posterBitmapCache.remove(value)
+        }
+
+        return when {
+            value.startsWith("http://") || value.startsWith("https://") -> {
+                scheduleHttpPosterPrefetch(value)
+                if (value == stickyPosterUri &&
+                    stickyPosterBitmap != null &&
+                    !stickyPosterBitmap!!.isRecycled
+                ) {
+                    stickyPosterBitmap
+                } else {
+                    null
+                }
+            }
+            else -> {
+                val decoded =
+                    try {
+                        decodeLocalPosterBitmap(value)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Poster decode failed: ${e.message}")
+                        null
+                    }
+                if (decoded != null) {
+                    addPosterToCache(value, decoded)
+                    stickyPosterUri = value
+                    stickyPosterBitmap = decoded
+                    decoded
+                } else if (value == stickyPosterUri &&
+                    stickyPosterBitmap != null &&
+                    !stickyPosterBitmap!!.isRecycled
+                ) {
+                    stickyPosterBitmap
+                } else {
+                    null
+                }
+            }
+        }
+    }
+
+    private fun decodeLocalPosterBitmap(value: String): Bitmap? {
+        val path = when {
+            value.startsWith("file://") -> value.removePrefix("file://")
+            else -> value
+        }
+        val file = File(path)
+        val absolute = if (file.exists()) file.absolutePath else path
+        val raw = BitmapFactory.decodeFile(absolute) ?: return null
+        return scaleBitmapForNotification(raw)
+    }
+
+    private fun downloadPosterFromHttp(url: String): Bitmap? {
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = POSTER_HTTP_TIMEOUT_MS
+            readTimeout = POSTER_HTTP_TIMEOUT_MS
+            doInput = true
+            instanceFollowRedirects = true
+            setRequestProperty(
+                "User-Agent",
+                "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+            )
+            setRequestProperty("Accept", "image/webp,image/apng,image/*,*/*;q=0.8")
+        }
+        connection.inputStream.use { input ->
+            val raw = BitmapFactory.decodeStream(input) ?: return null
+            return scaleBitmapForNotification(raw)
+        }
+    }
+
+    private fun scaleBitmapForNotification(src: Bitmap): Bitmap {
+        val maxDim = NOTIFICATION_ICON_MAX_PX
+        val w = src.width
+        val h = src.height
+        if (w <= 0 || h <= 0) return src
+        if (w <= maxDim && h <= maxDim) return src
+        val ratio = minOf(maxDim.toFloat() / w, maxDim.toFloat() / h)
+        val nw = (w * ratio).toInt().coerceAtLeast(1)
+        val nh = (h * ratio).toInt().coerceAtLeast(1)
+        return try {
+            Bitmap.createScaledBitmap(src, nw, nh, true)
+        } catch (e: Exception) {
+            Log.w(TAG, "Poster scale: ${e.message}")
+            src
+        }
     }
 }

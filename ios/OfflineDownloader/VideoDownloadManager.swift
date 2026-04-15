@@ -1,7 +1,7 @@
 import AVFoundation
 import Foundation
-import React
 import Network
+import React
 import MMKV
 
 enum PlaybackMode {
@@ -853,7 +853,6 @@ class VideoDownloadManager: NSObject {
                     
                     let allowedQualities = [480, 720, 1080]
                     
-                    var audioTracks: [[String: Any]] = []
                     var totalDurationSec = 0.0
                     
                     // Get duration
@@ -871,31 +870,34 @@ class VideoDownloadManager: NSObject {
                             streamType: streamType,
                             headers: headers
                         ) { videoTracks, videoTrackIdentifiers in
-                            
-                            // Process audio tracks (if separate audio/video)
-                            if streamType == .separateAudioVideo {
-                                audioTracks = self.processAudioTracks(asset: asset, duration: totalDurationSec)
-                            }
-                            
-                            // Store track identifiers
-                            self.storedTrackIdentifiers[masterUrl] = videoTrackIdentifiers
-                            
-                            let sortedVideoTracks = videoTracks.sorted { (first, second) -> Bool in
-                                let firstHeight = first["height"] as? Int ?? 0
-                                let secondHeight = second["height"] as? Int ?? 0
-                                return firstHeight > secondHeight
-                            }
-                            
-                            let result: [String: Any] = [
-                                "videoTracks": sortedVideoTracks,
-                                "audioTracks": audioTracks,
-                                "duration": totalDurationSec,
-                                "streamType": streamType.description,
-                                "allowedQualities": allowedQualities,
-                                "availableQualityCount": sortedVideoTracks.count
-                            ]
-                            
+                            // Mutate shared maps and resolve on main — parallel `getAvailableTracks`
+                            // (chunked queue) otherwise races on `storedTrackIdentifiers` and can crash.
                             DispatchQueue.main.async {
+                                var audioTracksMain: [[String: Any]] = []
+                                if streamType == .separateAudioVideo {
+                                    audioTracksMain = self.processAudioTracks(asset: asset, duration: totalDurationSec)
+                                }
+
+                                self.storedTrackIdentifiers[masterUrl] = videoTrackIdentifiers
+
+                                let sortedVideoTracks = videoTracks.sorted { (first, second) -> Bool in
+                                    let firstHeight = first["height"] as? Int ?? 0
+                                    let secondHeight = second["height"] as? Int ?? 0
+                                    return firstHeight > secondHeight
+                                }
+
+                                let prefersHevc = VideoQualityManager.isHevcHardwareDecodeSupported()
+                                let result: [String: Any] = [
+                                    "videoTracks": sortedVideoTracks,
+                                    "audioTracks": audioTracksMain,
+                                    "duration": totalDurationSec,
+                                    "streamType": streamType.description,
+                                    "allowedQualities": allowedQualities,
+                                    "availableQualityCount": sortedVideoTracks.count,
+                                    "deviceHevcHardwareDecodeSupported": prefersHevc,
+                                    "devicePreferredDownloadCodec": prefersHevc ? "hevc" : "h264",
+                                ]
+
                                 resolver(result)
                             }
                         }
@@ -946,10 +948,13 @@ class VideoDownloadManager: NSObject {
                         return
                     }
                     
-                    // Get stored track identifiers
+                    // Get stored track identifiers (keys are canonical 480/720/1080 after variant bucketing)
                     let storedTracks = self.storedTrackIdentifiers[masterUrl]
-                    let targetTrack = storedTracks?[selectedHeight]
-                    
+                    let targetTrack = self.pickStoredTrack(
+                        storedTracks: storedTracks,
+                        preferredHeight: selectedHeight,
+                    )
+
                     guard let track = targetTrack else {
                         rejecter("TRACK_NOT_FOUND", "Target track not found for \(selectedHeight)p", nil)
                         return
@@ -1072,19 +1077,7 @@ class VideoDownloadManager: NSObject {
             )
             
             downloadTask.resume()
-            
-            guard isJavascriptLoaded else {
-                return
-            }
-            
-            DispatchQueue.main.async {
-                self.eventEmitter?.sendEvent(withName: "DownloadProgress", body: [
-                    "downloadId": downloadId,
-                    "state": "queued",
-                    "progress": 0
-                ])
-            }
-            
+
             let response: [String: Any] = [
                 "downloadId": downloadId,
                 "state": "queued",
@@ -1093,10 +1086,19 @@ class VideoDownloadManager: NSObject {
                 "selectedHeight": selectedHeight,
                 "selectedWidth": selectedWidth,
                 "bitrate": track.bitrate,
-                "uri": masterUrl
+                "uri": masterUrl,
             ]
-            
+
+            // Always resolve — do not gate on isJavascriptLoaded (bridgeless can skip JS load notification).
             resolver(response)
+
+            DispatchQueue.main.async {
+                self.eventEmitter?.sendEvent(withName: "DownloadProgress", body: [
+                    "downloadId": downloadId,
+                    "state": "downloading",
+                    "progress": 0,
+                ])
+            }
         }
         
     private func resumeStalledDownloads() {
@@ -1272,13 +1274,9 @@ class VideoDownloadManager: NSObject {
         
         removePersistedTask(downloadId: downloadId)
         incompleteDownloads.remove(downloadId)
-        
-        if offlineRegistry.checkFileExists(downloadId: downloadId).exists {
-            offlineRegistry.removeDownload(downloadId: downloadId) { success, error in
-                resolver(success)
-            }
-        } else {
-            resolver(true)
+
+        offlineRegistry.removeDownload(downloadId: downloadId) { success, _ in
+            resolver(success)
         }
     }
     
@@ -1388,15 +1386,22 @@ class VideoDownloadManager: NSObject {
         stopProgressReporting(for: downloadId)
 
         let actualFileSize = getFileSize(at: location)
-        
-        // Register with OfflineVideoRegistry
-        offlineRegistry.registerDownload(downloadId: downloadId, localUrl: location) { success in
+        let totalBytes = getTotalBytes(downloadId: downloadId)
+
+        offlineRegistry.registerDownload(downloadId: downloadId, localUrl: location) { [weak self] success in
+            guard let self else { return }
             if success {
-                
-                guard self.isJavascriptLoaded else {
-                    return
-                }
-                // Emit completion event
+                self.removePersistedTask(downloadId: downloadId)
+                self.removePartialDownload(downloadId: downloadId)
+                self.updateProgressInfo(
+                    downloadId: downloadId,
+                    progress: 100.0,
+                    downloadedBytes: actualFileSize,
+                    isCompleted: true
+                )
+                self.activeDownloads.removeValue(forKey: downloadId)
+                self.downloadProgress.removeValue(forKey: downloadId)
+
                 DispatchQueue.main.async {
                     self.eventEmitter?.sendEvent(withName: "DownloadProgress", body: [
                         "downloadId": downloadId,
@@ -1404,14 +1409,14 @@ class VideoDownloadManager: NSObject {
                         "state": "completed",
                         "progress": 100,
                         "bytesDownloaded": actualFileSize,
+                        "formattedDownloaded": self.formatBytes(actualFileSize),
+                        "totalBytes": totalBytes,
+                        "formattedTotal": self.formatBytes(totalBytes),
                         "isCompleted": true
                     ])
                 }
             }
         }
-        
-        activeDownloads.removeValue(forKey: downloadId)
-        downloadProgress.removeValue(forKey: downloadId)
     }
     
     func getStorageInfo(
@@ -1488,6 +1493,27 @@ class VideoDownloadManager: NSObject {
         return headers
     }
     
+    /// Maps real presentation heights (540, 716, 864, …) to canonical tiers the JS layer requests (480/720/1080).
+    private func canonicalQualityTier(forPresentationHeight height: Int) -> Int? {
+        guard height >= 180 else { return nil }
+        if height < 560 { return 480 }
+        if height < 960 { return 720 }
+        return 1080
+    }
+
+    /// Picks a stored `TrackIdentifier` for the requested height with small tolerance and bitrate fallback.
+    private func pickStoredTrack(
+        storedTracks: [Int: TrackIdentifier]?,
+        preferredHeight: Int,
+    ) -> TrackIdentifier? {
+        guard let tracks = storedTracks, !tracks.isEmpty else { return nil }
+        if let t = tracks[preferredHeight] { return t }
+        let keys = tracks.keys.sorted()
+        if let k = keys.last(where: { $0 <= preferredHeight + 48 }), let t = tracks[k] { return t }
+        if let k = keys.first(where: { $0 >= preferredHeight - 48 }), let t = tracks[k] { return t }
+        return keys.compactMap { tracks[$0] }.max(by: { $0.bitrate < $1.bitrate })
+    }
+
     private func detectStreamTypeAdvanced(asset: AVURLAsset) -> StreamType {
         let hasAudioRenditions = asset.mediaSelectionGroup(forMediaCharacteristic: .audible) != nil
         
@@ -1510,6 +1536,26 @@ class VideoDownloadManager: NSObject {
         return .unknown
     }
     
+    /// When the manifest lists both HEVC and H.264, keep only renditions matching the device policy (HEVC if hardware-supported, else H.264).
+    private func filterVariantsForDownloadPolicy(_ variants: [AVAssetVariant], preferHevc: Bool) -> [AVAssetVariant] {
+        let candidates = variants.filter { variant in
+            guard variant.videoAttributes != nil else { return false }
+            if videoQualityManager.isDolbyVisionVariant(variant) { return false }
+            return true
+        }
+        if preferHevc {
+            let hevc = candidates.filter { videoQualityManager.isHevcVariant($0) }
+            if !hevc.isEmpty { return hevc }
+            let avc = candidates.filter { videoQualityManager.isH264Variant($0) }
+            return avc.isEmpty ? candidates : avc
+        } else {
+            let avc = candidates.filter { videoQualityManager.isH264Variant($0) }
+            if !avc.isEmpty { return avc }
+            let hevc = candidates.filter { videoQualityManager.isHevcVariant($0) }
+            return hevc.isEmpty ? candidates : hevc
+        }
+    }
+    
    private func processVideoVariantsWithSampling(
     asset: AVURLAsset,
     masterUrl: String,
@@ -1522,7 +1568,10 @@ class VideoDownloadManager: NSObject {
         var videoTracks: [[String: Any]] = []
         var videoTrackIdentifiers: [Int: TrackIdentifier] = [:]
         
-        for variant in asset.variants {
+        let preferHevc = VideoQualityManager.isHevcHardwareDecodeSupported()
+        let workingVariants = filterVariantsForDownloadPolicy(asset.variants, preferHevc: preferHevc)
+        
+        for variant in workingVariants {
             guard let videoAttributes = variant.videoAttributes else { continue }
             
             let height = Int(videoAttributes.presentationSize.height)
@@ -1537,56 +1586,60 @@ class VideoDownloadManager: NSObject {
             if videoQualityManager.isDolbyVisionVariant(variant) {
                 continue
             }
-            
-            if allowedQualities.contains(height) && bitrate > 0 {
-                let expectedMinBitrate = getMinExpectedBitrate(height: height)
-                let isProbablyIFrame = bitrate < expectedMinBitrate
-                
-                if !isProbablyIFrame {
-                    // Keep track with highest bitrate per quality
-                    if let existingTrack = videoTrackIdentifiers[height],
-                    bitrate <= existingTrack.bitrate {
-                        continue // Skip if we already have a better quality track
-                    }
-                    
-                    let estimatedSizeBytes = await calculateSizeWithSegmentSampling(
-                        variant: variant,
-                        masterUrl: masterUrl,
-                        duration: totalDurationSec,
-                        streamType: streamType,
-                        headers: headers
-                    )
-                    
-                    let trackIdentifier = TrackIdentifier(
-                        height: height,
-                        width: width,
-                        bitrate: bitrate,
-                        actualSizeBytes: estimatedSizeBytes,
-                        variant: variant
-                    )
-                    
-                    videoTrackIdentifiers[height] = trackIdentifier
-                    
-                    let trackData: [String: Any] = [
-                        "height": height,
-                        "width": width,
-                        "bitrate": bitrate,
-                        "size": Double(estimatedSizeBytes),
-                        "formattedSize": formatBytes(estimatedSizeBytes),
-                        "trackId": "\(height)x\(width)x\(bitrate)",
-                        "quality": "\(height)p",
-                        "streamType": streamType.description,
-                        "codec": videoQualityManager.codecTypeToString(videoAttributes.codecTypes.first ?? 0)
-                    ]
-                    
-                    // Remove existing track for this height if present
-                    videoTracks.removeAll { track in
-                        (track["height"] as? Int) == height
-                    }
-                    
-                    videoTracks.append(trackData)
-                    
+
+            guard let tierKey = canonicalQualityTier(forPresentationHeight: height), bitrate > 0 else {
+                continue
+            }
+
+            let expectedMinBitrate = getMinExpectedBitrate(height: height)
+            let isProbablyIFrame = bitrate < expectedMinBitrate
+
+            if !isProbablyIFrame {
+                // Keep best bitrate per canonical tier (not raw presentation height)
+                if let existingTrack = videoTrackIdentifiers[tierKey],
+                   bitrate <= existingTrack.bitrate {
+                    continue
                 }
+
+                let estimatedSizeBytes = await calculateSizeWithSegmentSampling(
+                    variant: variant,
+                    masterUrl: masterUrl,
+                    duration: totalDurationSec,
+                    streamType: streamType,
+                    headers: headers
+                )
+
+                let trackIdentifier = TrackIdentifier(
+                    height: height,
+                    width: width,
+                    bitrate: bitrate,
+                    actualSizeBytes: estimatedSizeBytes,
+                    variant: variant
+                )
+
+                videoTrackIdentifiers[tierKey] = trackIdentifier
+
+                let codecFamily: String = videoQualityManager.isHevcVariant(variant)
+                    ? "hevc"
+                    : (videoQualityManager.isH264Variant(variant) ? "h264" : "other")
+                let trackData: [String: Any] = [
+                    "height": tierKey,
+                    "width": width,
+                    "bitrate": bitrate,
+                    "size": Double(estimatedSizeBytes),
+                    "formattedSize": formatBytes(estimatedSizeBytes),
+                    "trackId": "\(tierKey)x\(width)x\(bitrate)_src\(height)",
+                    "quality": "\(tierKey)p",
+                    "streamType": streamType.description,
+                    "codec": videoQualityManager.codecTypeToString(videoAttributes.codecTypes.first ?? 0),
+                    "codecFamily": codecFamily,
+                ]
+
+                videoTracks.removeAll { track in
+                    (track["height"] as? Int) == tierKey
+                }
+
+                videoTracks.append(trackData)
             }
         }
         
@@ -1644,7 +1697,9 @@ class VideoDownloadManager: NSObject {
     
     private func getVariantPlaylistURL(from variant: AVAssetVariant, masterUrl: String) -> URL? {
         do {
-            let masterURL = URL(string: masterUrl)!
+            guard let masterURL = URL(string: masterUrl) else {
+                return nil
+            }
             let masterData = try Data(contentsOf: masterURL)
             let masterContent = String(data: masterData, encoding: .utf8) ?? ""
             
@@ -2042,31 +2097,38 @@ class VideoDownloadManager: NSObject {
     }
     
     private func startProgressReporting(for downloadId: String) {
-        stopProgressReporting(for: downloadId)
-
-        let timer = Timer.scheduledTimer(withTimeInterval: progressUpdateInterval, repeats: true) { [weak self] _ in
-            guard let self = self,
-                let downloadTask = self.activeDownloads[downloadId] else {
-                self?.stopProgressReporting(for: downloadId)
-                return
-            }
-                
-            if downloadTask.state == .running {
-                if let progressInfo = self.downloadProgress[downloadId] {
-                        self.emitProgressEvent(
-                        downloadId: downloadId,
-                        progress: progressInfo.percentage,
-                        downloadedBytes: progressInfo.downloadedBytes,
-                        state: "downloading"
-                    )
+        // Timers must use the main run loop; this is often invoked from the URLSession delegate queue.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.stopProgressReporting(for: downloadId)
+            let timer = Timer.scheduledTimer(withTimeInterval: self.progressUpdateInterval, repeats: true) { [weak self] _ in
+                guard let self,
+                      let downloadTask = self.activeDownloads[downloadId] else {
+                    self?.stopProgressReporting(for: downloadId)
+                    return
                 }
-            } else {
-                self.stopProgressReporting(for: downloadId)
+
+                if downloadTask.state == .running {
+                    if let progressInfo = self.downloadProgress[downloadId] {
+                        let isDone = progressInfo.percentage >= 99.5 || progressInfo.state == "completed"
+                        self.emitProgressEvent(
+                            downloadId: downloadId,
+                            progress: progressInfo.percentage,
+                            downloadedBytes: progressInfo.downloadedBytes,
+                            state: isDone ? "completed" : "downloading",
+                        )
+                    }
+                } else if downloadTask.state == .suspended {
+                    // Not running yet — keep timer; AVAssetDownloadTask can sit in suspended briefly.
+                    return
+                } else {
+                    self.stopProgressReporting(for: downloadId)
+                }
             }
+            RunLoop.main.add(timer, forMode: .common)
+            self.progressTimers[downloadId] = timer
         }
-            
-            progressTimers[downloadId] = timer
-        }
+    }
         
         private func stopProgressReporting(for downloadId: String) {
             if let timer = progressTimers[downloadId] {
@@ -2076,23 +2138,18 @@ class VideoDownloadManager: NSObject {
         }
         
         private func emitProgressEvent(downloadId: String, progress: Float, downloadedBytes: Int64, state: String) {
-            guard isJavascriptLoaded else {
-                return
-            }
             let totalBytes = getTotalBytes(downloadId: downloadId)
             DispatchQueue.main.async {
-                if let emitter = self.eventEmitter as? OfflineVideoDownloader {
-                    emitter.sendEvent(withName: "DownloadProgress", body: [
-                        "downloadId": downloadId,
-                        "progress": Int(progress),
-                        "bytesDownloaded": downloadedBytes,
-                        "formattedDownloaded": self.formatBytes(downloadedBytes),
-                        "totalBytes": Int64(totalBytes),
-                        "formattedTotal": self.formatBytes(totalBytes),
-                        "state": state,
-                        "isCompleted": state == "completed"
-                    ])
-                }
+                self.eventEmitter?.sendEvent(withName: "DownloadProgress", body: [
+                    "downloadId": downloadId,
+                    "progress": Int(progress),
+                    "bytesDownloaded": downloadedBytes,
+                    "formattedDownloaded": self.formatBytes(downloadedBytes),
+                    "totalBytes": Int64(totalBytes),
+                    "formattedTotal": self.formatBytes(totalBytes),
+                    "state": state,
+                    "isCompleted": state == "completed",
+                ])
             }
         }
     
@@ -2168,6 +2225,18 @@ class VideoDownloadManager: NSObject {
         }
 
         rejecter("DOWNLOAD_NOT_FOUND", "Download not found: \(downloadId)", nil)
+    }
+
+    func getVideoCodecDownloadPreference(
+        resolver: @escaping RCTPromiseResolveBlock,
+        rejecter: @escaping RCTPromiseRejectBlock
+    ) {
+        let hevc = VideoQualityManager.isHevcHardwareDecodeSupported()
+        resolver([
+            "preferredCodec": hevc ? "hevc" : "h264",
+            "hevcHardwareDecodeSupported": hevc,
+            "platform": "ios",
+        ])
     }
 
     func checkStorageSpace(
@@ -2318,22 +2387,21 @@ extension VideoDownloadManager: AVAssetDownloadDelegate {
             guard let self = self else { return }
             
             if success {
-                
+
                 self.removePersistedTask(downloadId: downloadId)
                 self.removePartialDownload(downloadId: downloadId)
-                
-                // Update progress info
+
                 self.updateProgressInfo(
                     downloadId: downloadId,
                     progress: 100.0,
                     downloadedBytes: actualFileSize,
                     isCompleted: true
                 )
-                
-                guard isJavascriptLoaded else {
-                    return
-                }
-                // Emit completion event
+
+                self.stopProgressReporting(for: downloadId)
+                self.activeDownloads.removeValue(forKey: downloadId)
+                self.downloadProgress.removeValue(forKey: downloadId)
+
                 DispatchQueue.main.async {
                     self.eventEmitter?.sendEvent(withName: "DownloadProgress", body: [
                         "downloadId": downloadId,
@@ -2347,11 +2415,7 @@ extension VideoDownloadManager: AVAssetDownloadDelegate {
                         "isCompleted": true
                     ])
                 }
-                
-                stopProgressReporting(for: downloadId)
-                self.activeDownloads.removeValue(forKey: downloadId)
-                self.downloadProgress.removeValue(forKey: downloadId)
-                
+
             } else {
                 print("Failed to register download: \(downloadId)")
             }
@@ -2365,11 +2429,9 @@ extension VideoDownloadManager: AVAssetDownloadDelegate {
         
         if let error = error {
             stopProgressReporting(for: downloadId)
-            
-            guard isJavascriptLoaded else {
-                return
-            }
-            
+            activeDownloads.removeValue(forKey: downloadId)
+            downloadProgress.removeValue(forKey: downloadId)
+
             DispatchQueue.main.async {
                 self.eventEmitter?.sendEvent(withName: "DownloadProgress", body: [
                     "downloadId": downloadId,
@@ -2377,9 +2439,6 @@ extension VideoDownloadManager: AVAssetDownloadDelegate {
                     "state": "failed"
                 ])
             }
-            
-            activeDownloads.removeValue(forKey: downloadId)
-            downloadProgress.removeValue(forKey: downloadId)
         }
     }
     
@@ -2423,11 +2482,8 @@ extension VideoDownloadManager: AVAssetDownloadDelegate {
         let totalBytes = getTotalBytes(downloadId: downloadId)
         
         updateProgressInfo(downloadId: downloadId, progress: percentComplete, downloadedBytes: estimatedBytes)
-        
-        guard isJavascriptLoaded else {
-            return
-        }
-        
+
+        let completed = percentComplete >= 100.0
         DispatchQueue.main.async {
             self.eventEmitter?.sendEvent(withName: "DownloadProgress", body: [
                 "downloadId": downloadId,
@@ -2436,7 +2492,8 @@ extension VideoDownloadManager: AVAssetDownloadDelegate {
                 "formattedDownloaded": self.formatBytes(estimatedBytes),
                 "totalBytes": Int64(totalBytes),
                 "formattedTotal": self.formatBytes(totalBytes),
-                "state": percentComplete >= 100.0 ? "completed" : "downloading"
+                "state": completed ? "completed" : "downloading",
+                "isCompleted": completed
             ])
         }
     }

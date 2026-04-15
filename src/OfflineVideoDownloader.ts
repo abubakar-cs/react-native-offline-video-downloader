@@ -18,6 +18,7 @@ import type {
   PlaybackModeResult,
   RestartResult,
   SyncProgressResult,
+  VideoCodecDownloadPreference,
 } from "../types";
 
 const { OfflineVideoDownloader } = NativeModules;
@@ -54,6 +55,27 @@ export class OfflineDownloader {
     } catch (error) {
       throw error;
     }
+  }
+
+  /**
+   * Local device only: whether hardware HEVC decode is available and which codec native offline
+   * download will prefer (`hevc` vs `h264`). Does not fetch the manifest or call `getAvailableTracks`.
+   * Pair with backend-supplied per-codec sizes to show the estimate that matches the download.
+   */
+  static async getVideoCodecDownloadPreference(): Promise<VideoCodecDownloadPreference> {
+    const raw = await OfflineVideoDownloader.getVideoCodecDownloadPreference();
+    const preferred =
+      raw?.preferredCodec === "hevc" ? "hevc" : "h264";
+    return {
+      preferredCodec: preferred,
+      hevcHardwareDecodeSupported: Boolean(raw?.hevcHardwareDecodeSupported),
+      platform:
+        raw?.platform === "android" || raw?.platform === "ios"
+          ? raw.platform
+          : Platform.OS === "ios"
+            ? "ios"
+            : "android",
+    };
   }
 
   /**
