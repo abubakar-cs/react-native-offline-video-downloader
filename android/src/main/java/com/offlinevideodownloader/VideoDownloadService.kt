@@ -61,6 +61,8 @@ class VideoDownloadService : DownloadService(
         private const val FOREGROUND_NOTIFICATION_ID = 1
         /** One slot for failed episode notifications (replaced if another fails). */
         private const val DOWNLOAD_FAILED_NOTIFICATION_ID = 57002
+        /** One slot for user-paused / stopped mid-progress (replaced if another episode pauses). */
+        private const val DOWNLOAD_PAUSED_NOTIFICATION_ID = 57003
         private const val FG_NOTIFICATION_MIN_REBUILD_INTERVAL_MS = 4_000L
         private const val AGGREGATE_QUANTUM_PERCENT = 5
         /** New id so devices pick up IMPORTANCE_DEFAULT (O+ won’t upgrade an old LOW channel). */
@@ -75,6 +77,8 @@ class VideoDownloadService : DownloadService(
         /** One async HTTP fetch per URL — avoids stacked futures and icon flicker. */
         private val httpPosterInflight =
             Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+        /** FG may keep polling after a delete; only treat completion as "real" shortly after STATE_COMPLETED terminalizes the batch. */
+        private const val RECENT_LEGIT_COMPLETE_MAX_MS = 180_000L
     }
 
     private var fgCachedNotification: Notification? = null
@@ -83,6 +87,24 @@ class VideoDownloadService : DownloadService(
 
     /** When Media3 passes an empty list, keep batch UI until the index no longer contains the batch. */
     private var lastStableBatchProgress: BatchProgress? = null
+
+    /**
+     * Batch we actually reached 100% for in [getForegroundNotification]. Used in [onDestroy] to
+     * re-post a dismissible completion tile after the FGS ends — without scanning the whole index
+     * (which would mis-attribute an older completed show after the user deletes another).
+     */
+    private var pendingPostDestroyCompletion: BatchProgress? = null
+
+    /**
+     * Last batch that received [Download.STATE_COMPLETED] from Media3 (any episode).
+     * Updated on every completed episode so [getForegroundNotification] can show the batch
+     * terminal state even if it runs before/without a separate terminalizing callback ordering.
+     */
+    private var recentlyLegitCompletedBatchId: String? = null
+    private var recentlyLegitCompletedAt: Long = 0L
+
+    /** Batch id we last showed as in-progress in FG (not yet 100%); bridges FG/listener race on final tick. */
+    private var lastBatchIdActivelyDownloading: String? = null
 
     /**
      * Last large icon we actually showed for this poster URL. HTTP loads are async; reusing avoids
@@ -134,12 +156,56 @@ class VideoDownloadService : DownloadService(
                 download: Download,
                 finalException: Exception?,
             ) {
-                if (download.state != Download.STATE_FAILED) return
-                try {
-                    notifyDownloadFailed(download, finalException)
-                } catch (e: Exception) {
-                    Log.w(TAG, "notifyDownloadFailed: ${e.message}")
+                when (download.state) {
+                    Download.STATE_COMPLETED -> {
+                        try {
+                            val meta = parseNotificationMeta(download) ?: return
+                            val bid = meta.batchId
+                            if (bid.isBlank()) return
+                            // Any episode completion for this batch — not only the terminal row — so FG
+                            // polls that already see 100% still match within RECENT_LEGIT_COMPLETE_MAX_MS.
+                            recentlyLegitCompletedBatchId = bid
+                            recentlyLegitCompletedAt = SystemClock.elapsedRealtime()
+                        } catch (e: Exception) {
+                            Log.w(TAG, "recentlyLegitCompleted: ${e.message}")
+                        }
+                    }
+                    Download.STATE_FAILED -> {
+                        try {
+                            notifyDownloadFailed(download, finalException)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "notifyDownloadFailed: ${e.message}")
+                        }
+                    }
+                    Download.STATE_STOPPED -> {
+                        // User pause / stop mid-save — skip never-started (0%) and finished (100%) rows.
+                        val pct =
+                            if (download.percentDownloaded.isNaN() || download.percentDownloaded < 0f) {
+                                0f
+                            } else {
+                                download.percentDownloaded
+                            }
+                        if (pct <= 0f || pct >= 99.5f) return
+                        try {
+                            notifyDownloadPaused(download)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "notifyDownloadPaused: ${e.message}")
+                        }
+                    }
+                    else -> Unit
                 }
+            }
+
+            override fun onDownloadRemoved(
+                manager: DownloadManager,
+                download: Download,
+            ) {
+                // User deleted a show (or any row removed) — do not let the next FG poll resurrect
+                // "Downloaded" for some other fully-complete batch still in the index.
+                recentlyLegitCompletedBatchId = null
+                recentlyLegitCompletedAt = 0L
+                pendingPostDestroyCompletion = null
+                lastBatchIdActivelyDownloading = null
             }
         }
 
@@ -183,29 +249,21 @@ class VideoDownloadService : DownloadService(
             getDownloadManager().removeListener(terminalNotificationListener)
         } catch (_: Exception) {
         }
-        var completedBatch: BatchProgress? = null
-        try {
-            val bp = resolveCurrentBatchProgress(emptyList())
-            if (bp != null &&
-                bp.totalEpisodes > 0 &&
-                bp.completedEpisodes >= bp.totalEpisodes
-            ) {
-                completedBatch = bp
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "onDestroy batch snapshot: ${e.message}")
-        }
+        val pending = pendingPostDestroyCompletion
+        pendingPostDestroyCompletion = null
         super.onDestroy()
-        if (completedBatch != null) {
+        // Re-post completion only for the batch we *just* finished in this service instance, and
+        // only if that batch is still in the index (skip if the user already removed those downloads).
+        if (pending != null && downloadIndexContainsBatchId(pending.batchId)) {
             try {
                 val nm =
                     applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                 nm.notify(
                     FOREGROUND_NOTIFICATION_ID,
-                    createBatchCompletedNotification(completedBatch),
+                    createBatchCompletedNotification(pending),
                 )
             } catch (e: Exception) {
-                Log.w(TAG, "Persistent completed notification: ${e.message}")
+                Log.w(TAG, "Post-destroy completion notification: ${e.message}")
             }
         }
     }
@@ -252,6 +310,8 @@ class VideoDownloadService : DownloadService(
             if (prevBatchId != null && prevBatchId != batchProgress.batchId) {
                 clearStickyPoster()
                 invalidateForegroundNotificationCache()
+                pendingPostDestroyCompletion = null
+                lastBatchIdActivelyDownloading = null
             }
             lastStableBatchProgress = batchProgress
 
@@ -259,12 +319,45 @@ class VideoDownloadService : DownloadService(
                 batchProgress.totalEpisodes > 0 &&
                     batchProgress.completedEpisodes >= batchProgress.totalEpisodes
 
+            if (!isComplete && batchProgress.batchId.isNotBlank()) {
+                lastBatchIdActivelyDownloading = batchProgress.batchId
+            }
+
             if (isComplete) {
                 val done =
                     batchProgress.copy(
                         aggregateProgress = 100,
                         completedEpisodes = batchProgress.totalEpisodes,
                     )
+                val now = SystemClock.elapsedRealtime()
+                var legit =
+                    batchProgress.batchId.isNotBlank() &&
+                        batchProgress.batchId == recentlyLegitCompletedBatchId &&
+                        (now - recentlyLegitCompletedAt) < RECENT_LEGIT_COMPLETE_MAX_MS
+                // FG can observe 100% before the listener runs; same batch we were showing in progress.
+                if (!legit &&
+                    batchProgress.batchId.isNotBlank() &&
+                    batchProgress.batchId == lastBatchIdActivelyDownloading
+                ) {
+                    legit = true
+                    recentlyLegitCompletedBatchId = batchProgress.batchId
+                    recentlyLegitCompletedAt = now
+                }
+
+                if (!legit) {
+                    // Fully-complete row still in index (e.g. another show) after a delete — not a fresh finish.
+                    lastStableBatchProgress = null
+                    pendingPostDestroyCompletion = null
+                    lastBatchIdActivelyDownloading = null
+                    clearStickyPoster()
+                    invalidateForegroundNotificationCache()
+                    return foregroundNotificationCached("g|idle|${batchProgress.batchId}") {
+                        createIdleDownloadsNotification()
+                    }
+                }
+
+                pendingPostDestroyCompletion = done
+                lastBatchIdActivelyDownloading = null
                 // Drop completed batch from sticky FG state so the next download doesn’t inherit
                 // this show’s title, episode count, or poster on the following notification ticks.
                 lastStableBatchProgress = null
@@ -306,6 +399,23 @@ class VideoDownloadService : DownloadService(
             .setAutoCancel(false)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .build()
+    }
+
+    /** Neutral FG tile when we must not show another show’s “Downloaded” from the index only. */
+    private fun createIdleDownloadsNotification(): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Downloads")
+            .setContentText(" ")
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setProgress(0, 0, false)
+            .setOngoing(true)
+            .setSilent(true)
+            .setAutoCancel(false)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
     }
@@ -372,6 +482,51 @@ class VideoDownloadService : DownloadService(
                 .setCategory(NotificationCompat.CATEGORY_ERROR)
         notificationLargeIcon(meta?.posterUri)?.let { builder.setLargeIcon(it) }
         nm.notify(DOWNLOAD_FAILED_NOTIFICATION_ID, builder.build())
+    }
+
+    private fun notifyDownloadPaused(download: Download) {
+        val meta = parseNotificationMeta(download)
+        val title =
+            meta?.showTitle?.takeIf { it.isNotBlank() } ?: "Offline download"
+        val episode = meta?.episodeTitle?.takeIf { it.isNotBlank() }
+        val pct =
+            if (download.percentDownloaded.isNaN() || download.percentDownloaded < 0f) {
+                0
+            } else {
+                download.percentDownloaded.toInt().coerceIn(0, 100)
+            }
+        val shortText =
+            if (episode != null) {
+                "$episode — Paused at $pct%"
+            } else {
+                "Paused at $pct%"
+            }
+        val bigText =
+            buildString {
+                append("Download paused. Open the app to resume when you are ready.")
+                append("\n\n")
+                append(shortText)
+            }
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val builder =
+            NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle(title)
+                .setContentText(shortText)
+                .setStyle(
+                    NotificationCompat.BigTextStyle()
+                        .setBigContentTitle(title)
+                        .bigText(bigText),
+                )
+                .setSmallIcon(android.R.drawable.ic_media_pause)
+                .setProgress(100, pct, false)
+                .setOngoing(false)
+                .setAutoCancel(true)
+                .setSilent(true)
+                .setOnlyAlertOnce(true)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .setCategory(NotificationCompat.CATEGORY_STATUS)
+        notificationLargeIcon(meta?.posterUri)?.let { builder.setLargeIcon(it) }
+        nm.notify(DOWNLOAD_PAUSED_NOTIFICATION_ID, builder.build())
     }
 
     private fun createNotificationChannel() {
@@ -487,6 +642,97 @@ class VideoDownloadService : DownloadService(
 
     private fun isTerminalBatchSnapshot(bp: BatchProgress): Boolean =
         bp.totalEpisodes > 0 && bp.completedEpisodes >= bp.totalEpisodes
+
+    /** Same aggregation as [resolveCurrentBatchProgress] but pinned to one [batchId] (any index row). */
+    private fun resolveBatchProgressForBatchId(batchId: String): BatchProgress? {
+        if (batchId.isBlank()) return null
+        var seededMeta: NotificationMeta? = null
+        try {
+            getDownloadManager().downloadIndex.getDownloads().use { c ->
+                while (c.moveToNext()) {
+                    val m = parseNotificationMeta(c.download) ?: continue
+                    if (m.batchId == batchId && m.batchTotal > 0) {
+                        seededMeta = m
+                        break
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "resolveBatchProgressForBatchId seed: ${e.message}")
+            return null
+        }
+        val sm = seededMeta ?: return null
+
+        val currentBatchId = sm.batchId
+        val currentBatchTotal = sm.batchTotal
+
+        val manager = getDownloadManager()
+        var completed = 0
+        var failed = 0
+        var progressAccumulator = 0f
+        var maxShowTitle = sm.showTitle
+        var maxPosterUri = sm.posterUri
+        var matched = 0
+
+        try {
+            val cursor: DownloadCursor = manager.downloadIndex.getDownloads()
+            cursor.use {
+                while (it.moveToNext()) {
+                    val d = it.download
+                    val meta = parseNotificationMeta(d) ?: continue
+                    if (meta.batchId != currentBatchId) continue
+                    matched += 1
+
+                    if (maxShowTitle.isBlank() && meta.showTitle.isNotBlank()) {
+                        maxShowTitle = meta.showTitle
+                    }
+                    if (maxPosterUri.isBlank() && meta.posterUri.isNotBlank()) {
+                        maxPosterUri = meta.posterUri
+                    }
+
+                    when (d.state) {
+                        Download.STATE_COMPLETED -> {
+                            completed += 1
+                            progressAccumulator += 100f
+                        }
+                        Download.STATE_FAILED -> {
+                            failed += 1
+                            progressAccumulator += 0f
+                        }
+                        Download.STATE_DOWNLOADING,
+                        Download.STATE_QUEUED,
+                        Download.STATE_RESTARTING,
+                        Download.STATE_STOPPED -> {
+                            val pct =
+                                if (d.percentDownloaded.isNaN() || d.percentDownloaded < 0f) {
+                                    0f
+                                } else {
+                                    d.percentDownloaded
+                                }
+                            progressAccumulator += pct.coerceIn(0f, 100f)
+                        }
+                        else -> Unit
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "resolveBatchProgressForBatchId: ${e.message}")
+            return null
+        }
+
+        val denominator = currentBatchTotal.coerceAtLeast(matched).coerceAtLeast(1)
+        val aggregate = (progressAccumulator / denominator).roundToInt().coerceIn(0, 100)
+
+        return BatchProgress(
+            batchId = currentBatchId,
+            showTitle = maxShowTitle,
+            posterUri = maxPosterUri,
+            totalEpisodes = denominator,
+            completedEpisodes = completed.coerceAtMost(denominator),
+            failedEpisodes = failed,
+            aggregateProgress = aggregate,
+        )
+    }
 
     private fun resolveCurrentBatchProgress(downloads: List<Download>): BatchProgress? {
         val seededMeta = findSeededNotificationMeta(downloads) ?: return null
