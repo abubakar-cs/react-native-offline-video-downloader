@@ -3,6 +3,9 @@ package com.offlinevideodownloader
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Intent
+import android.net.Uri
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.content.Context
@@ -116,6 +119,39 @@ class VideoDownloadService : DownloadService(
     private fun clearStickyPoster() {
         stickyPosterUri = ""
         stickyPosterBitmap = null
+    }
+
+    /**
+     * Opens the host app with `chaishots://offline-play?showId=…` so JS can navigate to offline playback.
+     * [batchId] is the show id passed from JS as `batchId` in download options.
+     */
+    private fun pendingIntentOpenOfflineShow(showId: String): PendingIntent? {
+        if (showId.isBlank()) return null
+        val ctx = applicationContext
+        val pkg = ctx.packageName
+        val base = ctx.packageManager.getLaunchIntentForPackage(pkg) ?: return null
+        val uri =
+            Uri.parse("chaishots://offline-play")
+                .buildUpon()
+                .appendQueryParameter("showId", showId)
+                .build()
+        val launch =
+            Intent(base).apply {
+                action = Intent.ACTION_VIEW
+                data = uri
+                addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP,
+                )
+            }
+        val reqCode = (0x52000 + showId.hashCode()) and 0xffff
+        return PendingIntent.getActivity(
+            ctx,
+            reqCode,
+            launch,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
     }
 
     private fun invalidateForegroundNotificationCache() {
@@ -437,6 +473,7 @@ class VideoDownloadService : DownloadService(
                 .setCategory(NotificationCompat.CATEGORY_PROGRESS)
                 .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
         notificationLargeIcon(bp.posterUri)?.let { builder.setLargeIcon(it) }
+        pendingIntentOpenOfflineShow(bp.batchId)?.let { builder.setContentIntent(it) }
         return builder.build()
     }
 
@@ -481,6 +518,8 @@ class VideoDownloadService : DownloadService(
                 .setPriority(NotificationCompat.PRIORITY_DEFAULT)
                 .setCategory(NotificationCompat.CATEGORY_ERROR)
         notificationLargeIcon(meta?.posterUri)?.let { builder.setLargeIcon(it) }
+        val bid = meta?.batchId?.takeIf { it.isNotBlank() } ?: ""
+        pendingIntentOpenOfflineShow(bid)?.let { builder.setContentIntent(it) }
         nm.notify(DOWNLOAD_FAILED_NOTIFICATION_ID, builder.build())
     }
 
@@ -526,6 +565,8 @@ class VideoDownloadService : DownloadService(
                 .setPriority(NotificationCompat.PRIORITY_DEFAULT)
                 .setCategory(NotificationCompat.CATEGORY_STATUS)
         notificationLargeIcon(meta?.posterUri)?.let { builder.setLargeIcon(it) }
+        val bidPaused = meta?.batchId?.takeIf { it.isNotBlank() } ?: ""
+        pendingIntentOpenOfflineShow(bidPaused)?.let { builder.setContentIntent(it) }
         nm.notify(DOWNLOAD_PAUSED_NOTIFICATION_ID, builder.build())
     }
 
@@ -574,6 +615,7 @@ class VideoDownloadService : DownloadService(
                 .setPriority(NotificationCompat.PRIORITY_DEFAULT)
                 .setCategory(NotificationCompat.CATEGORY_STATUS)
         notificationLargeIcon(bp.posterUri)?.let { builder.setLargeIcon(it) }
+        pendingIntentOpenOfflineShow(bp.batchId)?.let { builder.setContentIntent(it) }
         return builder.build()
     }
 
