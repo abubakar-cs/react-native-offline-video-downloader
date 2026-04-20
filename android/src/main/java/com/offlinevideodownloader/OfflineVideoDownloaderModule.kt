@@ -431,7 +431,12 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                                     }
                                 }
 
-                                storedTrackIdentifiers[masterUrl] = videoTrackIdentifiers
+                                val storageKey = masterUrlStorageKey(masterUrl)
+                                storedTrackIdentifiers[storageKey] = videoTrackIdentifiers
+                                Log.i(
+                                    MODULE_NAME,
+                                    "getAvailableTracks: storageKey=$storageKey (from ${masterUrl.take(120)}…)",
+                                )
 
                                 // Build response
                                 val videoTracks = Arguments.createArray()
@@ -553,6 +558,21 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
         return minOf(w, h)
     }
 
+    /**
+     * `getAvailableTracks` and `downloadStream` must share the same map key. Signed Mux/CDN URLs
+     * often differ only by query (token, exp) while the master playlist is the same; a full-URL
+     * key caused cache misses in release and forced [selectFallbackByResolution] (wrong rung).
+     */
+    private fun masterUrlStorageKey(url: String): String {
+        return try {
+            val u = URL(url)
+            val path = u.path.trimEnd('/')
+            "${u.protocol}://${u.host}$path"
+        } catch (_: Exception) {
+            url.substringBefore("?").trim()
+        }
+    }
+
     private fun scanManifestVideoCodecPresence(helper: DownloadHelper): Pair<Boolean, Boolean> {
         var hasHevc = false
         var hasAvc = false
@@ -645,12 +665,14 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                     override fun onPrepared(helper: DownloadHelper, tracksInfoAvailable: Boolean) {
                         try {
                             val streamType = detectStreamType(helper)
-                            val storedTracks = storedTrackIdentifiers[masterUrl]
+                            val storageKey = masterUrlStorageKey(masterUrl)
+                            val storedTracks = storedTrackIdentifiers[storageKey]
                             val targetTrack = storedTracks?.get(selectedHeight)
 
                             Log.i(
                                 MODULE_NAME,
-                                "downloadStream prepare: id=$downloadId requestedTier=${selectedHeight}p requestedBox=${selectedWidth}x${selectedHeight} " +
+                                "downloadStream prepare: id=$downloadId storageKey=$storageKey " +
+                                    "requestedTier=${selectedHeight}p requestedBox=${selectedWidth}x${selectedHeight} " +
                                     "storedKeys=${storedTracks?.keys?.sorted()} streamType=$streamType hit=${targetTrack != null}",
                             )
                             if (targetTrack != null) {
@@ -795,20 +817,26 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
         selectedWidth: Int,
         selectedHeight: Int,
     ) {
-        // JS passes landscape-style 1920x1080 for "1080p"; portrait manifests use 1080x1920.
-        // Constrain using sorted edges so min=max short×long matches both orientations.
+        // JS may pass 1920x1080 or 1080x1920; short edge = quality tier (480/720/1080) for vertical HLS.
         val shortEdge = minOf(selectedWidth, selectedHeight)
         val longEdge = maxOf(selectedWidth, selectedHeight)
+        // Snap to our manifest ladder so we never pin a min=max box that no variant matches
+        // (which can make the selector fall back to a low rung). Cap to the largest box for the tier.
+        val (capW, capH) = when {
+            shortEdge >= 1080 -> 1080 to 1920
+            shortEdge >= 720 -> 720 to 1280
+            else -> 480 to 854
+        }
 
-        Log.i(
+        Log.w(
             MODULE_NAME,
-            "selectFallbackByResolution: box ${shortEdge}x${longEdge} (from ${selectedWidth}x${selectedHeight})",
+            "selectFallbackByResolution: userBox ${shortEdge}x${longEdge} (from ${selectedWidth}x${selectedHeight}) " +
+                "-> cap ${capW}x${capH} (tier shortEdge=$shortEdge)",
         )
 
         val trackSelectorBuilder = DefaultTrackSelector.Parameters.Builder()
             .setForceHighestSupportedBitrate(true)
-            .setMaxVideoSize(shortEdge, longEdge)
-            .setMinVideoSize(shortEdge, longEdge)
+            .setMaxVideoSize(capW, capH)
             .setMaxAudioChannelCount(2)
 
         val trackSelectorParameters = trackSelectorBuilder.build()
