@@ -79,7 +79,7 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
     companion object {
         private const val MODULE_NAME = "OfflineVideoDownloader"
         /** Media3 `DownloadManager` parallel download cap + matching downloader thread pool size. */
-        private const val MAX_PARALLEL_DOWNLOADS = 3
+        private const val MAX_PARALLEL_DOWNLOADS = 2
         private var _downloadManager: DownloadManager? = null
 
         @Volatile
