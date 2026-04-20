@@ -688,11 +688,7 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
 
                                 when (streamType) {
                                     StreamType.SEPARATE_AUDIO_VIDEO -> {
-                                        selectSeparateAudioVideoTracks(
-                                            helper,
-                                            targetTrack,
-                                            masterUrl
-                                        )
+                                        selectSeparateAudioVideoTracks(helper, targetTrack)
                                     }
 
                                     StreamType.MUXED_VIDEO_AUDIO -> {
@@ -745,29 +741,31 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
     private fun selectSeparateAudioVideoTracks(
         helper: DownloadHelper,
         targetVideoTrack: TrackIdentifier,
-        masterUrl: String
     ) {
         try {
-            val parametersBuilder = DefaultTrackSelector.Parameters.Builder()
-                .setMaxVideoSize(targetVideoTrack.format.width, targetVideoTrack.format.height)
-                .setMinVideoSize(targetVideoTrack.format.width, targetVideoTrack.format.height)
-                .setMaxVideoBitrate(targetVideoTrack.format.bitrate + 200000)
-                .setMinVideoBitrate(maxOf(targetVideoTrack.format.bitrate - 200000, 0))
-
-                parametersBuilder
-                    .setPreferredAudioMimeType("audio/mp4a-latm")
-                    .setMaxAudioChannelCount(2)
-
-            val parameters = parametersBuilder
+            // Pin exact variant from ladder — min/max video size + bitrate bands let ExoPlayer pick
+            // another rung (e.g. 480p vs 1080p) when multiple renditions exist (portrait + dual codecs).
+            val videoOverride = TrackSelectionOverride(
+                targetVideoTrack.trackGroup,
+                listOf(targetVideoTrack.trackIndex),
+            )
+            val parameters = DefaultTrackSelector.Parameters.Builder()
+                .addOverride(videoOverride)
+                .setPreferredAudioMimeType("audio/mp4a-latm")
+                .setMaxAudioChannelCount(2)
                 .setSelectUndeterminedTextLanguage(false)
-                .setForceHighestSupportedBitrate(false)
                 .build()
+
+            Log.i(
+                MODULE_NAME,
+                "selectSeparateAudioVideoTracks: pinned ${targetVideoTrack.format.width}x${targetVideoTrack.format.height} " +
+                    "tier=${qualityTierHeightPx(targetVideoTrack.format)}p codecs=${targetVideoTrack.format.codecs}",
+            )
 
             for (periodIndex in 0 until helper.periodCount) {
                 helper.clearTrackSelections(periodIndex)
                 helper.addTrackSelection(periodIndex, parameters)
             }
-
         } catch (e: Exception) {
             throw e
         }
