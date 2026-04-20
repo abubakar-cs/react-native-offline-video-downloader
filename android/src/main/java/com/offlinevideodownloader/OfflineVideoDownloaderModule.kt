@@ -299,19 +299,20 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                                                             continue
                                                         }
 
-                                                        if (format.height in allowedQualities && format.bitrate > 0) {
+                                                        val tierHeight = qualityTierHeightPx(format)
+                                                        if (tierHeight in allowedQualities && format.bitrate > 0) {
                                                             // Filter I-FRAME streams
                                                             val isIFrameStream = (format.roleFlags and C.ROLE_FLAG_TRICK_PLAY) != 0 ||
                                                                     format.containerMimeType?.contains("image") == true
-                                                            val expectedMinBitrate = getMinExpectedBitrate(format.height)
+                                                            val expectedMinBitrate = getMinExpectedBitrate(tierHeight)
                                                             val isProbablyIFrame = format.bitrate < expectedMinBitrate
 
                                                             if (!isIFrameStream && !isProbablyIFrame) {
-                                                                // Keep track with highest bitrate per quality
-                                                                val existingBitrate = videoBitrateMap[format.height] ?: 0
+                                                                // Keep track with highest bitrate per quality tier (480/720/1080 short edge)
+                                                                val existingBitrate = videoBitrateMap[tierHeight] ?: 0
 
                                                                 if (format.bitrate > existingBitrate) {
-                                                                    videoBitrateMap[format.height] = format.bitrate
+                                                                    videoBitrateMap[tierHeight] = format.bitrate
 
                                                                     val estimatedSizeBytes = if (totalDurationSec > 0) {
                                                                         withContext(Dispatchers.IO) {
@@ -325,7 +326,7 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                                                                         }
                                                                     } else 0L
 
-                                                                    videoTrackIdentifiers[format.height] = TrackIdentifier(
+                                                                    videoTrackIdentifiers[tierHeight] = TrackIdentifier(
                                                                         periodIndex = periodIndex,
                                                                         groupIndex = groupIndex,
                                                                         trackIndex = trackIndex,
@@ -335,13 +336,14 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                                                                     )
 
                                                                     val trackData = Arguments.createMap().apply {
+                                                                        putInt("qualityTier", tierHeight)
                                                                         putInt("height", format.height)
                                                                         putInt("width", format.width)
                                                                         putInt("bitrate", format.bitrate)
                                                                         putDouble("size", estimatedSizeBytes.toDouble())
                                                                         putString("formattedSize", formatBytes(estimatedSizeBytes))
                                                                         putString("trackId", "$periodIndex:$groupIndex:$trackIndex")
-                                                                        putString("quality", "${format.height}p")
+                                                                        putString("quality", "${tierHeight}p")
                                                                         putString("streamType", streamType.name)
                                                                         putString("codecs", format.codecs)
                                                                         putString(
@@ -354,9 +356,13 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                                                                         )
                                                                     }
 
-                                                                    videoTrackMap[format.height] = trackData
+                                                                    videoTrackMap[tierHeight] = trackData
 
-                                                                    Log.d(MODULE_NAME, "Selected SDR track: ${format.height}p, ${format.bitrate} bps, codec: ${format.codecs}")
+                                                                    Log.i(
+                                                                        MODULE_NAME,
+                                                                        "track ladder: tier=${tierHeight}p pixels=${format.width}x${format.height} " +
+                                                                            "${format.bitrate}bps codec=${format.codecs} preferHevc=$preferHevc",
+                                                                    )
                                                                 }
                                                             }
                                                         }
@@ -457,6 +463,11 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                                     )
                                 })
 
+                                Log.i(
+                                    MODULE_NAME,
+                                    "getAvailableTracks: tiers=${videoTrackMap.keys.sorted()} manifestHevc=$manifestHasHevc manifestAvc=$manifestHasAvc preferHevc=$preferHevc",
+                                )
+
                             } catch (e: Exception) {
                                 promise.reject("PROCESSING_ERROR", "Failed to process tracks: ${e.message}")
                             } finally {
@@ -528,6 +539,18 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
         if (mime.contains("avc")) return true
         val codecs = format.codecs?.lowercase() ?: ""
         return codecs.contains("avc1") || codecs.contains("avc3")
+    }
+
+    /**
+     * Maps manifest renditions to 480 / 720 / 1080 ladder keys.
+     * Portrait HLS uses e.g. RESOLUTION=720x1280 — [Format.height] is 1280, not 720.
+     * Using the shorter edge matches industry "720p" tiers for vertical video.
+     */
+    private fun qualityTierHeightPx(format: Format): Int {
+        val w = format.width
+        val h = format.height
+        if (w <= 0 || h <= 0) return 0
+        return minOf(w, h)
     }
 
     private fun scanManifestVideoCodecPresence(helper: DownloadHelper): Pair<Boolean, Boolean> {
@@ -625,7 +648,18 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                             val storedTracks = storedTrackIdentifiers[masterUrl]
                             val targetTrack = storedTracks?.get(selectedHeight)
 
+                            Log.i(
+                                MODULE_NAME,
+                                "downloadStream prepare: id=$downloadId requestedTier=${selectedHeight}p requestedBox=${selectedWidth}x${selectedHeight} " +
+                                    "storedKeys=${storedTracks?.keys?.sorted()} streamType=$streamType hit=${targetTrack != null}",
+                            )
                             if (targetTrack != null) {
+                                Log.i(
+                                    MODULE_NAME,
+                                    "downloadStream selection: pixels=${targetTrack.format.width}x${targetTrack.format.height} " +
+                                        "tier=${qualityTierHeightPx(targetTrack.format)}p bitrate=${targetTrack.format.bitrate} " +
+                                        "codecs=${targetTrack.format.codecs}",
+                                )
                                 for (periodIndex in 0 until helper.periodCount) {
                                     helper.clearTrackSelections(periodIndex)
                                 }
@@ -649,6 +683,11 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                                 }
 
                             } else {
+                                Log.w(
+                                    MODULE_NAME,
+                                    "downloadStream: no stored TrackIdentifier for tier=${selectedHeight} — using fallback " +
+                                        "(ensure getAvailableTracks ran for this master URL)",
+                                )
                                 selectFallbackByResolution(helper, selectedWidth, selectedHeight)
                             }
 
@@ -756,11 +795,20 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
         selectedWidth: Int,
         selectedHeight: Int,
     ) {
+        // JS passes landscape-style 1920x1080 for "1080p"; portrait manifests use 1080x1920.
+        // Constrain using sorted edges so min=max short×long matches both orientations.
+        val shortEdge = minOf(selectedWidth, selectedHeight)
+        val longEdge = maxOf(selectedWidth, selectedHeight)
+
+        Log.i(
+            MODULE_NAME,
+            "selectFallbackByResolution: box ${shortEdge}x${longEdge} (from ${selectedWidth}x${selectedHeight})",
+        )
 
         val trackSelectorBuilder = DefaultTrackSelector.Parameters.Builder()
             .setForceHighestSupportedBitrate(true)
-            .setMaxVideoSize(selectedWidth, selectedHeight)
-            .setMinVideoSize(selectedWidth, selectedHeight)
+            .setMaxVideoSize(shortEdge, longEdge)
+            .setMinVideoSize(shortEdge, longEdge)
             .setMaxAudioChannelCount(2)
 
         val trackSelectorParameters = trackSelectorBuilder.build()
@@ -801,9 +849,11 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
 
             if (targetTrack != null) {
                 putString("expectedSize", formatBytes(targetTrack.actualSizeBytes))
+                putInt("qualityTier", qualityTierHeightPx(targetTrack.format))
                 putInt("selectedHeight", targetTrack.format.height)
                 putInt("selectedWidth", targetTrack.format.width)
                 putInt("bitrate", targetTrack.format.bitrate)
+                putString("selectedCodecs", targetTrack.format.codecs ?: "")
             } else {
                 putString("expectedSize", "Unknown")
             }
