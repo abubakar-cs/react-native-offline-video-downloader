@@ -665,49 +665,20 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                     override fun onPrepared(helper: DownloadHelper, tracksInfoAvailable: Boolean) {
                         try {
                             val streamType = detectStreamType(helper)
-                            val storageKey = masterUrlStorageKey(masterUrl)
-                            val storedTracks = storedTrackIdentifiers[storageKey]
-                            val targetTrack = storedTracks?.get(selectedHeight)
-
+                            /**
+                             * Always use resolution caps from JS (tier short edge + long edge). Do not use
+                             * [storedTrackIdentifiers] from [getAvailableTracks] — that cache could miss in
+                             * release (signed URL drift, races) and caused inconsistent rung selection.
+                             */
                             Log.i(
                                 MODULE_NAME,
-                                "downloadStream prepare: id=$downloadId storageKey=$storageKey " +
-                                    "requestedTier=${selectedHeight}p requestedBox=${selectedWidth}x${selectedHeight} " +
-                                    "storedKeys=${storedTracks?.keys?.sorted()} streamType=$streamType hit=${targetTrack != null}",
+                                "downloadStream prepare: id=$downloadId streamType=$streamType " +
+                                    "tier=${selectedHeight}p box=${selectedWidth}x${selectedHeight} (ExoPlayer max-size cap)",
                             )
-                            if (targetTrack != null) {
-                                Log.i(
-                                    MODULE_NAME,
-                                    "downloadStream selection: pixels=${targetTrack.format.width}x${targetTrack.format.height} " +
-                                        "tier=${qualityTierHeightPx(targetTrack.format)}p bitrate=${targetTrack.format.bitrate} " +
-                                        "codecs=${targetTrack.format.codecs}",
-                                )
-                                for (periodIndex in 0 until helper.periodCount) {
-                                    helper.clearTrackSelections(periodIndex)
-                                }
-
-                                when (streamType) {
-                                    StreamType.SEPARATE_AUDIO_VIDEO -> {
-                                        selectSeparateAudioVideoTracks(helper, targetTrack)
-                                    }
-
-                                    StreamType.MUXED_VIDEO_AUDIO -> {
-                                        selectMuxedVideoTrack(helper, targetTrack)
-                                    }
-
-                                    StreamType.UNKNOWN -> {
-                                        selectFallbackTracks(helper, targetTrack)
-                                    }
-                                }
-
-                            } else {
-                                Log.w(
-                                    MODULE_NAME,
-                                    "downloadStream: no stored TrackIdentifier for tier=${selectedHeight} — using fallback " +
-                                        "(ensure getAvailableTracks ran for this master URL)",
-                                )
-                                selectFallbackByResolution(helper, selectedWidth, selectedHeight)
+                            for (periodIndex in 0 until helper.periodCount) {
+                                helper.clearTrackSelections(periodIndex)
                             }
+                            selectFallbackByResolution(helper, selectedWidth, selectedHeight)
 
                             val metaBytes = buildDownloadNotificationMetaBytes(options)
                             val downloadRequest = helper.getDownloadRequest(downloadId, metaBytes)
@@ -718,7 +689,7 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                                 context, VideoDownloadService::class.java, downloadRequest, false
                             )
 
-                            promise.resolve(createDownloadResponse(downloadRequest, streamType, targetTrack))
+                            promise.resolve(createDownloadResponse(downloadRequest, streamType, null))
 
                         } catch (e: Exception) {
                             promise.reject("SELECTION_ERROR", "Failed to select tracks: ${e.message}")
