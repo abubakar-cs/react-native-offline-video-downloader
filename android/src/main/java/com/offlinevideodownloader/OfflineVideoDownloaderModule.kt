@@ -8,6 +8,7 @@ import android.os.Looper
 import androidx.media3.common.C
 import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.TrackGroup
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.util.Log
@@ -797,16 +798,43 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
             else -> 480 to 854
         }
 
+        // `DefaultTrackSelector.Parameters.setMaxVideoSize(maxW, maxH)` keeps renditions where
+        // format.width <= maxW AND format.height <= maxH. A (short,long) pair such as 1080×1920
+        // rejects landscape 1920×1080 (1920 > 1080), so release/catalogs with landscape ladders
+        // incorrectly fell back to ~480p. Use a square bound at the long edge so both
+        // 1920×1080 and 1080×1920 (and 1280×720 / 720×1280, etc.) stay eligible at the same tier.
+        val maxBound = maxOf(capW, capH)
+
         Log.w(
             MODULE_NAME,
             "selectFallbackByResolution: userBox ${shortEdge}x${longEdge} (from ${selectedWidth}x${selectedHeight}) " +
-                "-> cap ${capW}x${capH} (tier shortEdge=$shortEdge)",
+                "-> capBox ${capW}x${capH} maxBound=${maxBound}x${maxBound} (tier shortEdge=$shortEdge)",
         )
 
         val trackSelectorBuilder = DefaultTrackSelector.Parameters.Builder()
             .setForceHighestSupportedBitrate(true)
-            .setMaxVideoSize(capW, capH)
+            .setMaxVideoSize(maxBound, maxBound)
             .setMaxAudioChannelCount(2)
+
+        val (manifestHasHevc, manifestHasAvc) = scanManifestVideoCodecPresence(helper)
+        val preferHevc = isHevcDecoderSupported()
+        val preferredVideoMime = when {
+            preferHevc && manifestHasHevc -> MimeTypes.VIDEO_H265
+            preferHevc && !manifestHasHevc && manifestHasAvc -> MimeTypes.VIDEO_H264
+            !preferHevc && manifestHasAvc -> MimeTypes.VIDEO_H264
+            !preferHevc && !manifestHasAvc && manifestHasHevc -> MimeTypes.VIDEO_H265
+            manifestHasHevc -> MimeTypes.VIDEO_H265
+            manifestHasAvc -> MimeTypes.VIDEO_H264
+            else -> null
+        }
+        if (preferredVideoMime != null) {
+            trackSelectorBuilder.setPreferredVideoMimeTypes(preferredVideoMime)
+            Log.w(
+                MODULE_NAME,
+                "selectFallbackByResolution: preferredVideoMime=$preferredVideoMime " +
+                    "(preferHevc=$preferHevc manifestHevc=$manifestHasHevc manifestAvc=$manifestHasAvc)",
+            )
+        }
 
         val trackSelectorParameters = trackSelectorBuilder.build()
 
