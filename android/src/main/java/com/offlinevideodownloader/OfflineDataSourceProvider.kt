@@ -117,9 +117,9 @@ class OfflineDataSourceProvider(private val context: Context) {
 
             var foundMatch = false
             var checkedCount = 0
-            val maxChecks = 50
+            val maxChecks = 600
             val startTime = System.currentTimeMillis()
-            val maxTime = 3000L
+            val maxTime = 10000L
 
             try {
                 while (downloadsCursor.moveToNext() && checkedCount < maxChecks &&
