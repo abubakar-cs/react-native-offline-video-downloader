@@ -234,19 +234,19 @@ class PersistentCacheEvictor : CacheEvictor {
     }
 
     override fun onStartFile(cache: androidx.media3.datasource.cache.Cache, key: String, position: Long, length: Long) {
-        Log.d(TAG, "Starting file: $key (${formatBytes(length)})")
+        // Log.d(TAG, "Starting file: $key (${formatBytes(length)})")
     }
 
     override fun onSpanAdded(cache: androidx.media3.datasource.cache.Cache, span: CacheSpan) {
-        Log.d(TAG, "Content cached: ${span.key} (${formatBytes(span.length)})")
+        // Log.d(TAG, "Content cached: ${span.key} (${formatBytes(span.length)})")
     }
 
     override fun onSpanRemoved(cache: androidx.media3.datasource.cache.Cache, span: CacheSpan) {
-        Log.d(TAG, "Content removed: ${span.key} (${formatBytes(span.length)})")
+        // Log.d(TAG, "Content removed: ${span.key} (${formatBytes(span.length)})")
     }
 
     override fun onSpanTouched(cache: androidx.media3.datasource.cache.Cache, oldSpan: CacheSpan, newSpan: CacheSpan) {
-        Log.v(TAG, "Content accessed: ${newSpan.key}")
+        // Log.v(TAG, "Content accessed: ${newSpan.key}")
     }
 
     override fun requiresCacheSpanTouches(): Boolean {
