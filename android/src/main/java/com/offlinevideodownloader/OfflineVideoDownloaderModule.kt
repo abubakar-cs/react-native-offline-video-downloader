@@ -679,7 +679,33 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                             for (periodIndex in 0 until helper.periodCount) {
                                 helper.clearTrackSelections(periodIndex)
                             }
-                            selectFallbackByResolution(helper, selectedWidth, selectedHeight)
+                            val pinnedTrack =
+                                findBestVideoTrackForRequestedTier(helper, selectedWidth, selectedHeight)
+                            if (pinnedTrack != null) {
+                                when (streamType) {
+                                    StreamType.SEPARATE_AUDIO_VIDEO -> {
+                                        selectSeparateAudioVideoTracks(helper, pinnedTrack)
+                                    }
+                                    StreamType.MUXED_VIDEO_AUDIO -> {
+                                        selectFallbackTracks(helper, pinnedTrack)
+                                    }
+                                    StreamType.UNKNOWN -> {
+                                        selectFallbackTracks(helper, pinnedTrack)
+                                    }
+                                }
+                                Log.i(
+                                    MODULE_NAME,
+                                    "downloadStream: pinned ${pinnedTrack.format.width}x${pinnedTrack.format.height} " +
+                                        "tier=${qualityTierHeightPx(pinnedTrack.format)}p bitrate=${pinnedTrack.format.bitrate} " +
+                                        "codecs=${pinnedTrack.format.codecs}",
+                                )
+                            } else {
+                                Log.w(
+                                    MODULE_NAME,
+                                    "downloadStream: no exact track for requested tier, falling back to selector caps",
+                                )
+                                selectFallbackByResolution(helper, selectedWidth, selectedHeight)
+                            }
 
                             val metaBytes = buildDownloadNotificationMetaBytes(options)
                             val downloadRequest = helper.getDownloadRequest(downloadId, metaBytes)
@@ -708,6 +734,90 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                 promise.reject("DOWNLOAD_SETUP_ERROR", "Failed to set up download: ${e.message}")
             }
         }
+    }
+
+    private fun findBestVideoTrackForRequestedTier(
+        helper: DownloadHelper,
+        selectedWidth: Int,
+        selectedHeight: Int,
+    ): TrackIdentifier? {
+        val requestedShort = minOf(selectedWidth, selectedHeight)
+        val requestedTier = when {
+            requestedShort >= 1080 -> 1080
+            requestedShort >= 720 -> 720
+            else -> 480
+        }
+        val tierFallbackOrder = when (requestedTier) {
+            1080 -> listOf(1080, 720, 480)
+            720 -> listOf(720, 480)
+            else -> listOf(480)
+        }
+
+        val (manifestHasHevc, manifestHasAvc) = scanManifestVideoCodecPresence(helper)
+        val preferHevc = isHevcDecoderSupported()
+
+        var bestTrack: TrackIdentifier? = null
+        var bestTierScore = Int.MAX_VALUE
+        var bestBitrate = Int.MIN_VALUE
+
+        for (periodIndex in 0 until helper.periodCount) {
+            val mappedTrackInfo = helper.getMappedTrackInfo(periodIndex)
+            for (rendererIndex in 0 until mappedTrackInfo.rendererCount) {
+                if (mappedTrackInfo.getRendererType(rendererIndex) != C.TRACK_TYPE_VIDEO) continue
+                val trackGroups = mappedTrackInfo.getTrackGroups(rendererIndex)
+                for (groupIndex in 0 until trackGroups.length) {
+                    val group = trackGroups.get(groupIndex)
+                    for (trackIndex in 0 until group.length) {
+                        val format = group.getFormat(trackIndex)
+                        if (isDolbyVisionFormat(format)) continue
+                        if (
+                            !shouldIncludeVideoFormatForDownload(
+                                format,
+                                preferHevc,
+                                manifestHasHevc,
+                                manifestHasAvc,
+                            )
+                        ) {
+                            continue
+                        }
+
+                        val tier = qualityTierHeightPx(format)
+                        val tierOrder = tierFallbackOrder.indexOf(tier)
+                        if (tierOrder < 0) continue
+
+                        val isIFrameStream =
+                            (format.roleFlags and C.ROLE_FLAG_TRICK_PLAY) != 0 ||
+                                format.containerMimeType?.contains("image") == true
+                        val expectedMinBitrate = getMinExpectedBitrate(tier)
+                        val isProbablyIFrame = format.bitrate in 1 until expectedMinBitrate
+                        if (isIFrameStream || isProbablyIFrame) continue
+
+                        val bitrate = if (format.bitrate > 0) format.bitrate else 0
+                        if (tierOrder < bestTierScore || (tierOrder == bestTierScore && bitrate > bestBitrate)) {
+                            bestTierScore = tierOrder
+                            bestBitrate = bitrate
+                            bestTrack = TrackIdentifier(
+                                periodIndex = periodIndex,
+                                groupIndex = groupIndex,
+                                trackIndex = trackIndex,
+                                format = format,
+                                trackGroup = group,
+                                actualSizeBytes = 0L,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if (bestTrack == null) {
+            Log.w(
+                MODULE_NAME,
+                "findBestVideoTrackForRequestedTier: no match for tier=$requestedTier " +
+                    "preferHevc=$preferHevc manifestHevc=$manifestHasHevc manifestAvc=$manifestHasAvc",
+            )
+        }
+        return bestTrack
     }
 
     private fun selectSeparateAudioVideoTracks(
