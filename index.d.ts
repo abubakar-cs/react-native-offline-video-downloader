@@ -15,7 +15,7 @@ declare module "react-native-offline-video-downloader" {
   export interface AudioTrack {
     language: string;
     label: string;
-    hannelCount: number; // Will always be <= 2 for stereo/mono
+    channelCount: number; // Will always be <= 2 for stereo/mono
     audioType: "stereo" | "mono";
     bitrate: number;
     size: number; // Size in bytes

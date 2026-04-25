@@ -1678,7 +1678,11 @@ class VideoDownloadManager: NSObject {
     ) async -> Int64? {
         
         do {
-            guard let variantURL = getVariantPlaylistURL(from: variant, masterUrl: masterUrl) else {
+            guard let variantURL = await getVariantPlaylistURL(
+                from: variant,
+                masterUrl: masterUrl,
+                headers: headers
+            ) else {
                 return nil
             }
             
@@ -1695,13 +1699,19 @@ class VideoDownloadManager: NSObject {
         }
     }
     
-    private func getVariantPlaylistURL(from variant: AVAssetVariant, masterUrl: String) -> URL? {
+    private func getVariantPlaylistURL(
+        from variant: AVAssetVariant,
+        masterUrl: String,
+        headers: [String: String]?
+    ) async -> URL? {
         do {
             guard let masterURL = URL(string: masterUrl) else {
                 return nil
             }
-            let masterData = try Data(contentsOf: masterURL)
-            let masterContent = String(data: masterData, encoding: .utf8) ?? ""
+            let masterContent = try await downloadPlaylist(url: masterURL, headers: headers)
+            guard !masterContent.isEmpty else {
+                return nil
+            }
             
             let lines = masterContent.components(separatedBy: .newlines)
             var foundVariantLine = false
@@ -2192,6 +2202,8 @@ class VideoDownloadManager: NSObject {
                 "progress": Int(progressInfo.percentage),
                 "bytesDownloaded": progressInfo.downloadedBytes,
                 "totalBytes": progressInfo.totalBytes,
+                "formattedDownloaded": formatBytes(progressInfo.downloadedBytes),
+                "formattedTotal": formatBytes(progressInfo.totalBytes),
                 "isCompleted": progressInfo.state == "completed"
             ])
             return
@@ -2202,6 +2214,10 @@ class VideoDownloadManager: NSObject {
                 "downloadId": downloadId,
                 "state": "stopped",
                 "progress": 0,
+                "bytesDownloaded": 0,
+                "totalBytes": 0,
+                "formattedDownloaded": formatBytes(0),
+                "formattedTotal": formatBytes(0),
                 "isCompleted": false
             ])
             return
@@ -2219,6 +2235,10 @@ class VideoDownloadManager: NSObject {
                 "uri": localUrl.absoluteString,
                 "state": "completed",
                 "progress": 100,
+                "bytesDownloaded": 0,
+                "totalBytes": 0,
+                "formattedDownloaded": formatBytes(0),
+                "formattedTotal": formatBytes(0),
                 "isCompleted": true
             ])
             return
@@ -2244,7 +2264,27 @@ class VideoDownloadManager: NSObject {
         rejecter: @escaping RCTPromiseRejectBlock
     ) {
         let storageInfo = offlineRegistry.getStorageStats()
-        resolver(storageInfo)
+        let currentCacheSize = storageInfo["totalSize"] as? Double ?? 0
+        let availableSpace = storageInfo["availableSpace"] as? Double ?? 0
+        let totalCacheSize = storageInfo["maxSize"] as? Double ?? 0
+        
+        resolver([
+            "currentCacheSizeMB": currentCacheSize / (1024 * 1024),
+            "availableSpaceMB": availableSpace / (1024 * 1024),
+            "totalCacheSizeMB": totalCacheSize / (1024 * 1024),
+            "currentCacheFormatted": formatBytes(Int64(currentCacheSize)),
+            "availableSpaceFormatted": formatBytes(Int64(availableSpace)),
+            "hasEnoughSpace": availableSpace > (2 * 1024 * 1024 * 1024),
+            // Preserve legacy keys for existing consumers.
+            "totalSize": currentCacheSize,
+            "maxSize": totalCacheSize,
+            "availableSpace": availableSpace,
+            "usedPercentage": storageInfo["usedPercentage"] as? Int ?? 0,
+            "path": storageInfo["path"] as? String ?? "",
+            "isProtected": storageInfo["isProtected"] as? Bool ?? true,
+            "deviceTotalSpace": storageInfo["deviceTotalSpace"] as? Double ?? 0,
+            "deviceFreeSpace": storageInfo["deviceFreeSpace"] as? Double ?? 0
+        ])
     }
 
     func canDownloadContent(
@@ -2259,7 +2299,9 @@ class VideoDownloadManager: NSObject {
         resolver([
             "canDownload": canDownload,
             "availableSpaceMB": availableSpace / (1024 * 1024),
-            "requiredSpaceMB": Double(estimatedSizeBytes) / (1024 * 1024)
+            "requiredSpaceMB": Double(estimatedSizeBytes) / (1024 * 1024),
+            "availableSpaceFormatted": formatBytes(Int64(availableSpace)),
+            "requiredSpaceFormatted": formatBytes(estimatedSizeBytes)
         ])
     }
 
