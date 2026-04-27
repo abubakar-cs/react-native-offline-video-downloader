@@ -1743,29 +1743,8 @@ class OfflineVideoDownloaderModule(private val reactContext: ReactApplicationCon
                 cursor.close()
             }
 
-            val activeCount = downloads.count { info ->
-                val state = info.getString("state")
-                state == "queued" || state == "downloading" || state == "restarting"
-            }
-            val completedCount = downloads.count { info ->
-                info.getBoolean("isCompleted")
-            }
-            val incompleteCount = downloads.count { info ->
-                val state = info.getString("state")
-                state == "stopped" || state == "failed"
-            }
-
-            val downloadsArray = Arguments.createArray().apply {
+            promise.resolve(Arguments.createArray().apply {
                 downloads.forEach { pushMap(it) }
-            }
-
-            promise.resolve(Arguments.createMap().apply {
-                putInt("totalDownloads", downloads.size)
-                putInt("activeDownloads", activeCount)
-                putInt("completedDownloads", completedCount)
-                putInt("incompleteDownloads", incompleteCount)
-                putInt("restoredDownloads", 0)
-                putArray("downloads", downloadsArray)
             })
         } catch (e: Exception) {
             promise.reject("SYNC_ERROR", e.message)
